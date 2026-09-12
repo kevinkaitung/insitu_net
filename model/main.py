@@ -46,6 +46,11 @@ def parse_args():
   parser.add_argument("--resume", type=str, default="",
                       help="path to the latest checkpoint (default: none)")
 
+  parser.add_argument("--test-data-len", type=int, default=1000,
+                      help="number of samples drawn from the test set each "
+                           "epoch (default: 1000; use 0 for the full test set, "
+                           "e.g. for the mpas_sub sample which only has 100)")
+
   parser.add_argument("--dsp", type=int, default=3,
                       help="dimensions of the simulation parameters (default: 3)")
   parser.add_argument("--dvo", type=int, default=3,
@@ -117,7 +122,7 @@ def main(args):
   test_dataset = MPASDataset(
       root=args.root,
       train=False,
-      data_len=1000,
+      data_len=args.test_data_len,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   kwargs = {"num_workers": 4, "pin_memory": True} if args.cuda else {}

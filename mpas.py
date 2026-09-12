@@ -16,6 +16,14 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, utils
 
+def _load_params(split_dir):
+  # the packaged mpas_sub.zip sample ships "params_sub.npy" instead of
+  # the "params.npy" name used by the full dataset
+  params_path = os.path.join(split_dir, "params.npy")
+  if not os.path.isfile(params_path):
+    params_path = os.path.join(split_dir, "params_sub.npy")
+  return np.load(params_path)
+
 class MPASDataset(Dataset):
   def __init__(self, root, train=True, data_len=0, transform=None):
     self.root = root
@@ -23,13 +31,15 @@ class MPASDataset(Dataset):
     self.data_len = data_len
     self.transform = transform
     if self.train:
-      self.filenames = pd.read_csv(os.path.join(root, "train/filenames.txt"),
+      split_dir = os.path.join(root, "train")
+      self.filenames = pd.read_csv(os.path.join(split_dir, "filenames.txt"),
                                    sep=" ", header=None)
-      self.params = np.load(os.path.join(root, "train/params.npy"))
+      self.params = _load_params(split_dir)
     else:
-      self.filenames = pd.read_csv(os.path.join(root, "test/filenames.txt"),
+      split_dir = os.path.join(root, "test")
+      self.filenames = pd.read_csv(os.path.join(split_dir, "filenames.txt"),
                                    sep=" ", header=None)
-      self.params = np.load(os.path.join(root, "test/params.npy"))
+      self.params = _load_params(split_dir)
 
   # TODO(wenbin): deal with data_len correctly.
   def __len__(self):

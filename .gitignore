@@ -1,0 +1,16 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# macOS zip-extraction metadata (AppleDouble sidecar files from mpas_sub.zip,
+# created on macOS - not training output, safe to delete)
+__MACOSX/
+
+# training outputs
+tmp/
+*.pth
+*.pth.tar
+
+# extracted sample dataset (regenerate via `unzip mpas_sub.zip`;
+# main.py also saves checkpoints into this directory when --root points here)
+mpas_sub/
