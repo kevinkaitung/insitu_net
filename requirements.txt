@@ -6,3 +6,4 @@ scikit-image==0.22.0
 matplotlib==3.8.3
 tqdm==4.66.1
 Pillow==10.1.0
+wandb==0.26.1

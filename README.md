@@ -28,6 +28,7 @@ unzip -q mpas_sub.zip
 cd model
 PYTHONPATH=.. python main.py \
   --root ../mpas_sub \
+  --output-dir ../logs/sample \
   --dsp 1 --dvo 3 --dvp 3 \
   --test-data-len 0 \
   --batch-size 16 --epochs 5 --check-every 1 --log-every 1 \
@@ -41,3 +42,14 @@ Notes:
   since `mpas_sub/test` only has 100 images.
 - `PYTHONPATH=..` is required so `model/main.py` can import `mpas.py` from
   the repo root.
+- `--output-dir` is a required, per-run directory: checkpoints go to
+  `<output-dir>/checkpoints/` (`checkpoint_epoch####.pth.tar` with optimizer
+  state, `generator_epoch####.pth` with just the generator weights, saved
+  every `--check-every` epochs and always on the final epoch) and generated
+  comparison images go to `<output-dir>/images/` (one per epoch). It's
+  separate from `--root`, which is only ever read as the dataset.
+- Loss curves (train batch/epoch loss, test loss, and D/G loss when GAN loss
+  is enabled) are logged to [wandb](https://wandb.ai) under the
+  `--wandb-project` project (default `insitu-net`); wandb's local run files
+  are also written under `--output-dir`. Pass `--no-wandb` to disable, e.g.
+  when running offline without a wandb account configured.

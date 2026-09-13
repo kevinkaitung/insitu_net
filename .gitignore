@@ -6,11 +6,13 @@ __pycache__/
 # created on macOS - not training output, safe to delete)
 __MACOSX/
 
-# training outputs
+# training outputs (checkpoints/images land under --output-dir;
+# logs/ is the convention used in the README's sample command)
 tmp/
+logs/
+wandb/
 *.pth
 *.pth.tar
 
-# extracted sample dataset (regenerate via `unzip mpas_sub.zip`;
-# main.py also saves checkpoints into this directory when --root points here)
+# extracted sample dataset (regenerate via `unzip mpas_sub.zip`)
 mpas_sub/
