@@ -23,9 +23,8 @@ from torch.autograd import Variable
 from torch.utils.data import Dataset, DataLoader
 from torchvision.utils import save_image
 
-import sys
-sys.path.append("../datasets")
-from mpas import *
+from torchvision import transforms
+from ffgs_images import FFGSImageDataset, Normalize, ToTensor
 
 from generator import Generator
 from discriminator import Discriminator
@@ -43,32 +42,48 @@ def parse_args():
                       help="random seed (default: 1)")
 
   parser.add_argument("--root", required=True, type=str,
-                      help="root of the dataset")
+                      help="root directory containing one subfolder per "
+                           "scene, each with gaussian_splat/transforms.json "
+                           "and gaussian_splat/images/")
   parser.add_argument("--output-dir", required=True, type=str,
                       help="directory to save this run's checkpoints, "
                            "generated images, and wandb run files")
   parser.add_argument("--resume", type=str, default="",
                       help="path to the latest checkpoint (default: none)")
 
-  parser.add_argument("--test-data-len", type=int, default=1000,
-                      help="number of samples drawn from the test set each "
-                           "epoch (default: 1000; use 0 for the full test set, "
-                           "e.g. for the mpas_sub sample which only has 100)")
+  parser.add_argument("--test-scene-fraction", type=float, default=0.1,
+                      help="fraction of scenes held out entirely for "
+                           "testing (default: 0.1)")
+  parser.add_argument("--scene-split-seed", type=int, default=42,
+                      help="random seed for the train/test scene split, "
+                           "independent of --seed (default: 42)")
 
-  parser.add_argument("--dsp", type=int, default=3,
-                      help="dimensions of the simulation parameters (default: 3)")
-  parser.add_argument("--dvo", type=int, default=3,
-                      help="dimensions of the visualization operations (default: 3)")
   parser.add_argument("--dvp", type=int, default=3,
                       help="dimensions of the view parameters (default: 3)")
-  parser.add_argument("--dspe", type=int, default=512,
-                      help="dimensions of the simulation parameters' encode (default: 512)")
-  parser.add_argument("--dvoe", type=int, default=512,
-                      help="dimensions of the visualization operations' encode (default: 512)")
   parser.add_argument("--dvpe", type=int, default=512,
                       help="dimensions of the view parameters' encode (default: 512)")
+  parser.add_argument("--dife", type=int, default=512,
+                      help="dimensions of the input image feature encode (default: 512)")
   parser.add_argument("--ch", type=int, default=64,
                       help="channel multiplier (default: 64)")
+
+  parser.add_argument("--vit-img-size", type=int, default=256,
+                      help="input image resolution for the ViT image encoder (default: 256)")
+  parser.add_argument("--vit-patch-size", type=int, default=16,
+                      help="patch size for the ViT image encoder (default: 16)")
+  parser.add_argument("--vit-embed-dim", type=int, default=512,
+                      help="embedding dim of the ViT image encoder (default: 512)")
+  parser.add_argument("--vit-depth", type=int, default=4,
+                      help="number of transformer blocks in the ViT image encoder (default: 4)")
+  parser.add_argument("--vit-num-heads", type=int, default=8,
+                      help="number of attention heads in the ViT image encoder (default: 8)")
+  parser.add_argument("--vit-mlp-ratio", type=float, default=4.0,
+                      help="MLP hidden-dim ratio in the ViT image encoder (default: 4.0)")
+  parser.add_argument("--no-vit-qk-norm", action="store_true", default=False,
+                      help="disable QK-norm in the ViT image encoder")
+  parser.add_argument("--vit-init-values", type=float, default=0.01,
+                      help="LayerScale init value in the ViT image encoder; "
+                           "pass 0 to disable LayerScale (default: 0.01)")
 
   parser.add_argument("--sn", action="store_true", default=False,
                       help="enable spectral normalization")
@@ -140,15 +155,16 @@ def main(args):
   torch.manual_seed(args.seed)
 
   # data loader
-  train_dataset = MPASDataset(
-      root=args.root,
-      train=True,
+  train_dataset = FFGSImageDataset(
+      root=args.root, train=True,
+      test_scene_fraction=args.test_scene_fraction,
+      scene_split_seed=args.scene_split_seed,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
-  test_dataset = MPASDataset(
-      root=args.root,
-      train=False,
-      data_len=args.test_data_len,
+  test_dataset = FFGSImageDataset(
+      root=args.root, train=False,
+      test_scene_fraction=args.test_scene_fraction,
+      scene_split_seed=args.scene_split_seed,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   kwargs = {"num_workers": 4, "pin_memory": True} if args.cuda else {}
@@ -176,9 +192,12 @@ def main(args):
     else:
       return m
 
-  g_model = Generator(dsp=args.dsp, dvo=args.dvo, dvp=args.dvp,
-                      dspe=args.dspe, dvoe=args.dvoe, dvpe=args.dvpe,
-                      ch=args.ch)
+  g_model = Generator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch,
+                      img_size=args.vit_img_size, patch_size=args.vit_patch_size,
+                      vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
+                      vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
+                      vit_qk_norm=not args.no_vit_qk_norm,
+                      vit_init_values=args.vit_init_values)
   g_model.apply(weights_init)
   # if args.sn:
   #   g_model = add_sn(g_model)
@@ -188,9 +207,12 @@ def main(args):
   g_model.to(device)
 
   if args.gan_loss != "none":
-    d_model = Discriminator(dsp=args.dsp, dvo=args.dvo, dvp=args.dvp,
-                            dspe=args.dspe, dvoe=args.dvoe, dvpe=args.dvpe,
-                            ch=args.ch)
+    d_model = Discriminator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch,
+                            img_size=args.vit_img_size, patch_size=args.vit_patch_size,
+                            vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
+                            vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
+                            vit_qk_norm=not args.no_vit_qk_norm,
+                            vit_init_values=args.vit_init_values)
     d_model.apply(weights_init)
     if args.sn:
       d_model = add_sn(d_model)
@@ -246,11 +268,10 @@ def main(args):
     train_loss = 0.
     for i, sample in enumerate(train_loader):
       image = sample["image"].to(device)
-      sparams = sample["sparams"].to(device)
-      vops = sample["vops"].to(device)
+      input_image = sample["input_image"].to(device)
       vparams = sample["vparams"].to(device)
       g_optimizer.zero_grad()
-      fake_image = g_model(sparams, vops, vparams)
+      fake_image = g_model(input_image, vparams)
 
       loss = 0.
 
@@ -258,14 +279,14 @@ def main(args):
       if args.gan_loss != "none":
         # update discriminator
         d_optimizer.zero_grad()
-        decision = d_model(sparams, vops, vparams, image)
+        decision = d_model(input_image, vparams, image)
 
         if args.gan_loss == "vanilla":
           d_loss_real = torch.mean(F.softplus(-decision))
         elif args.gan_loss == "hinge":
           d_loss_real = torch.mean(F.relu(1. - decision))
 
-        fake_decision = d_model(sparams, vops, vparams, fake_image.detach())
+        fake_decision = d_model(input_image, vparams, fake_image.detach())
 
         if args.gan_loss == "vanilla":
           d_loss_fake = torch.mean(F.softplus(fake_decision))
@@ -279,7 +300,7 @@ def main(args):
 
         # loss of generator
         g_optimizer.zero_grad()
-        fake_decision = d_model(sparams, vops, vparams, fake_image)
+        fake_decision = d_model(input_image, vparams, fake_image)
 
         if args.gan_loss == "vanilla":
           g_loss = args.gan_loss_weight * torch.mean(F.softplus(-fake_decision))
@@ -306,12 +327,12 @@ def main(args):
 
       loss.backward()
       g_optimizer.step()
-      train_loss += loss.item() * len(sparams)
+      train_loss += loss.item() * image.size(0)
 
       # log training status
       if i % args.log_every == 0:
         print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-          epoch, i * len(sparams), len(train_loader.dataset),
+          epoch, i * image.size(0), len(train_loader.dataset),
           100. * i / len(train_loader),
           loss.item()))
         wandb_log({"epoch": epoch, "train/batch_loss": loss.item()})
@@ -337,16 +358,15 @@ def main(args):
     with torch.no_grad():
       for i, sample in enumerate(test_loader):
         image = sample["image"].to(device)
-        sparams = sample["sparams"].to(device)
-        vops = sample["vops"].to(device)
+        input_image = sample["input_image"].to(device)
         vparams = sample["vparams"].to(device)
-        fake_image = g_model(sparams, vops, vparams)
-        test_loss += mse_criterion(image, fake_image).item() * len(sparams)
+        fake_image = g_model(input_image, vparams)
+        test_loss += mse_criterion(image, fake_image).item() * image.size(0)
 
         if i == 0:
-          n = min(len(sparams), 8)
+          n = min(image.size(0), 8)
           comparison = torch.cat(
-              [image[:n], fake_image.view(len(sparams), 3, 256, 256)[:n]])
+              [image[:n], fake_image.view(image.size(0), 3, 256, 256)[:n]])
           save_image(((comparison.cpu() + 1.) * .5),
                      os.path.join(img_dir, "epoch_{:04d}.png".format(epoch)),
                      nrow=n)

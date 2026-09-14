@@ -10,26 +10,28 @@ import torch.nn.functional as F
 
 from resblock import BasicBlockGenerator
 from self_attention import SelfAttention
+from vit_encoder import ViTImageEncoder
 
 class Generator(nn.Module):
-  def __init__(self, dsp=1, dvo=3, dvp=3, dspe=512, dvoe=512, dvpe=512, ch=64):
+  def __init__(self, dvp=3, dvpe=512, dife=512, ch=64,
+               img_size=256, patch_size=16, vit_embed_dim=512, vit_depth=4,
+               vit_num_heads=8, vit_mlp_ratio=4.0, vit_qk_norm=True,
+               vit_init_values=0.01):
     super(Generator, self).__init__()
 
-    self.dsp, self.dspe = dsp, dspe
-    self.dvo, self.dvoe = dvo, dvoe
     self.dvp, self.dvpe = dvp, dvpe
+    self.dife = dife
     self.ch = ch
 
-    # simulation parameters subnet
-    self.sparams_subnet = nn.Sequential(
-      nn.Linear(dsp, dspe), nn.ReLU(),
-      nn.Linear(dspe, dspe), nn.ReLU()
+    # input-image conditioning subnet (replaces sparams_subnet + vops_subnet)
+    self.image_encoder = ViTImageEncoder(
+      img_size=img_size, patch_size=patch_size, embed_dim=vit_embed_dim,
+      depth=vit_depth, num_heads=vit_num_heads, mlp_ratio=vit_mlp_ratio,
+      qk_norm=vit_qk_norm, init_values=vit_init_values
     )
-
-    # visualization operations subnet
-    self.vops_subnet = nn.Sequential(
-      nn.Linear(dvo, dvoe), nn.ReLU(),
-      nn.Linear(dvoe, dvoe), nn.ReLU()
+    self.image_proj_subnet = nn.Sequential(
+      nn.Linear(self.image_encoder.embed_dim, dife), nn.ReLU(),
+      nn.Linear(dife, dife), nn.ReLU()
     )
 
     # view parameters subnet
@@ -40,7 +42,7 @@ class Generator(nn.Module):
 
     # merged parameters subnet
     self.mparams_subnet = nn.Sequential(
-      nn.Linear(dspe + dvoe + dvpe, ch * 16 * 4 * 4, bias=False)
+      nn.Linear(dife + dvpe, ch * 16 * 4 * 4, bias=False)
     )
 
     # image generation subnet
@@ -58,12 +60,12 @@ class Generator(nn.Module):
       nn.Tanh()
     )
 
-  def forward(self, sp, vo, vp):
-    sp = self.sparams_subnet(sp)
-    vo = self.vops_subnet(vo)
+  def forward(self, input_image, vp):
+    img_feat = self.image_encoder(input_image)
+    img_feat = self.image_proj_subnet(img_feat)
     vp = self.vparams_subnet(vp)
 
-    mp = torch.cat((sp, vo, vp), 1)
+    mp = torch.cat((img_feat, vp), 1)
     mp = self.mparams_subnet(mp)
 
     x = mp.view(mp.size(0), self.ch * 16, 4, 4)

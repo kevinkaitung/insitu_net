@@ -18,30 +18,41 @@ python -m pip install -r requirements.txt
 
 ## Sample training command
 
-A small sample of the MPAS-Ocean dataset used in the paper is packaged in
-`mpas_sub.zip` (100 train / 100 test images). Extract it and point `--root`
-at the extracted folder:
+`main.py` was repurposed to take an input *image* as conditioning (via a
+vendored ViT encoder, `model/vit_encoder.py`) instead of the original
+`sparams`/`vops` scalar parameters, to serve as an image-conditioned
+baseline. `model/ffgs_images.py`'s `FFGSImageDataset` reads a directory of
+volume-rendered scenes and produces the `image`/`input_image`/`vparams`
+samples `Generator`/`Discriminator` expect. Each scene subfolder under
+`--root` must contain `gaussian_splat/transforms.json` (nerfstudio-style:
+`frames: [{file_path, transform_matrix}]`, OpenGL c2w convention) and
+`gaussian_splat/images/*.jpg`; anything else under `--root` is skipped
+automatically. `--dvp`/`--dvpe` stay at their defaults (3/512) — the derived
+`vparams` (camera position relative to its scene's own center, as a unit
+vector) is already 3-dimensional.
 
 ```bash
-unzip -q mpas_sub.zip
-
 cd model
-PYTHONPATH=.. python main.py \
-  --root ../mpas_sub \
-  --output-dir ../logs/sample \
-  --dsp 1 --dvo 3 --dvp 3 \
-  --test-data-len 0 \
-  --batch-size 16 --epochs 5 --check-every 1 --log-every 1 \
+python main.py \
+  --root /home/kctung/Projects/FFGS-benchmark/datasets/rendered_images/CQ500_processed_new \
+  --output-dir ../logs/cq500_sample \
+  --test-scene-fraction 0.1 --scene-split-seed 42 \
+  --batch-size 8 --epochs 5 --check-every 1 --log-every 5 \
   --perc-loss relu1_2 --mse-loss
 ```
 
+No `PYTHONPATH=..` needed — `ffgs_images.py` lives in `model/` alongside
+everything that imports it.
+
 Notes:
-- `--dsp 1` matches this dataset's simulation parameter dimensionality (see
-  `mpas.py`'s `sparams` slicing), not the `main.py` default of 3.
-- `--test-data-len 0` uses the full test split instead of the default 1000,
-  since `mpas_sub/test` only has 100 images.
-- `PYTHONPATH=..` is required so `model/main.py` can import `mpas.py` from
-  the repo root.
+- `--test-scene-fraction`/`--scene-split-seed` control the train/test split:
+  it's a **held-out-scenes** split (whole scenes go entirely to train or
+  entirely to test), not held-out views within a scene, so it generalizes
+  to a full dataset of many thousands of scenes.
+- The input/target image pairing is random per sample during training (a
+  fresh, different view from the same scene each draw) and deterministic
+  during testing (`(target_idx + num_views // 2) % num_views`) for
+  reproducible eval.
 - `--output-dir` is a required, per-run directory: checkpoints go to
   `<output-dir>/checkpoints/` (`checkpoint_epoch####.pth.tar` with optimizer
   state, `generator_epoch####.pth` with just the generator weights, saved
@@ -53,3 +64,15 @@ Notes:
   `--wandb-project` project (default `insitu-net`); wandb's local run files
   are also written under `--output-dir`. Pass `--no-wandb` to disable, e.g.
   when running offline without a wandb account configured.
+
+### Legacy: original MPAS parameter-conditioned example
+
+`mpas.py` and the packaged `mpas_sub.zip` sample (100 train / 100 test
+MPAS-Ocean images, from the original upstream paper) are no longer wired
+into `main.py` at all: the Generator/Discriminator no longer accept the
+`--dsp`/`--dvo`/`--dspe`/`--dvoe` flags `mpas.py`'s parameter-conditioned
+samples require, since `main.py` now expects `input_image` (via
+`ffgs_images.py`) instead of `sparams`/`vops`. Both files are left in place
+for reference / provenance, but there's no runnable command against them
+with the current `main.py` — see git history prior to the ViT-conditioning
+change for the original invocation.
