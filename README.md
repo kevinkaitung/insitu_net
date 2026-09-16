@@ -65,6 +65,32 @@ Notes:
   are also written under `--output-dir`. Pass `--no-wandb` to disable, e.g.
   when running offline without a wandb account configured.
 
+## Distributed training
+
+`main.py` uses [HuggingFace `accelerate`](https://github.com/huggingface/accelerate)
+for multi-GPU training (`Accelerator()`, DDP-wrapped model(s), sharded
+dataloaders, cross-process loss aggregation via `gather_for_metrics`) —
+the same approach `methods/TokenGS` uses. `acc_configs/gpu1.yaml` (single
+process) and `acc_configs/gpu8.yaml` (8-way `MULTI_GPU`) are provided;
+`python main.py ...` (no `accelerate launch` at all) still works unchanged
+for single-GPU/CPU runs, since `Accelerator()` with no active launch
+config just defaults to single-process.
+
+```bash
+cd model
+accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
+  --root /home/kctung/Projects/FFGS-benchmark/datasets/rendered_images/CQ500_processed_new \
+  --output-dir ../logs/cq500_8gpu \
+  --test-scene-fraction 0.1 --scene-split-seed 42 \
+  --batch-size 8 --epochs 5 --check-every 1 --log-every 5 \
+  --perc-loss relu1_2 --mse-loss
+```
+
+`--batch-size` is **per-GPU**: the effective global batch size scales with
+`num_processes` in the chosen `acc_configs/*.yaml`, so going from 1 to 8
+GPUs at the same `--batch-size` multiplies the global batch 8x — `--lr`/
+`--d-lr` likely need scaling up to match, same as any DDP setup.
+
 ### Legacy: original MPAS parameter-conditioned example
 
 `mpas.py` and the packaged `mpas_sub.zip` sample (100 train / 100 test

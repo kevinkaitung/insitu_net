@@ -9,11 +9,13 @@ from __future__ import absolute_import, division, print_function
 import os
 import argparse
 import math
+import random
 
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import wandb
+from accelerate import Accelerator
 
 import torch
 import torch.nn as nn
@@ -34,10 +36,6 @@ from vgg19 import VGG19
 def parse_args():
   parser = argparse.ArgumentParser(description="InSituNet")
 
-  parser.add_argument("--no-cuda", action="store_true", default=False,
-                      help="disables CUDA training")
-  parser.add_argument("--data-parallel", action="store_true", default=False,
-                      help="enable data parallelism")
   parser.add_argument("--seed", type=int, default=1,
                       help="random seed (default: 1)")
 
@@ -128,31 +126,42 @@ def parse_args():
 
 # the main function
 def main(args):
+  accelerator = Accelerator()
+  device = accelerator.device
+
   # unified experiment-output directory: checkpoints/ and images/ for this
   # run both live under here, separate from --root (the dataset)
   ckpt_dir = os.path.join(args.output_dir, "checkpoints")
   img_dir = os.path.join(args.output_dir, "images")
-  os.makedirs(ckpt_dir, exist_ok=True)
-  os.makedirs(img_dir, exist_ok=True)
+  if accelerator.is_main_process:
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(img_dir, exist_ok=True)
 
-  if not args.no_wandb:
+  if not args.no_wandb and accelerator.is_main_process:
     wandb.init(project=args.wandb_project, name=args.wandb_run_name,
               config=vars(args), dir=args.output_dir)
 
   def wandb_log(data):
-    if not args.no_wandb:
+    if not args.no_wandb and accelerator.is_main_process:
       wandb.log(data)
 
   # log hyperparameters
-  print(args)
-
-  # select device
-  args.cuda = not args.no_cuda and torch.cuda.is_available()
-  device = torch.device("cuda:0" if args.cuda else "cpu")
+  if accelerator.is_main_process:
+    print(args)
 
   # set random seed
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
+
+  # each DataLoader worker process needs its own random/numpy seed --
+  # torch's own RNG is auto-diversified per worker, but Python's global
+  # `random` module (used by FFGSImageDataset's random input-view pairing)
+  # is not, so without this, workers forked from the same parent can
+  # inherit identical `random` state and produce correlated "random" pairs
+  def _worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
   # data loader
   train_dataset = FFGSImageDataset(
@@ -167,7 +176,7 @@ def main(args):
       scene_split_seed=args.scene_split_seed,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
-  kwargs = {"num_workers": 4, "pin_memory": True} if args.cuda else {}
+  kwargs = {"num_workers": 4, "pin_memory": True, "worker_init_fn": _worker_init_fn}
   train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                             shuffle=True, **kwargs)
   test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
@@ -202,10 +211,6 @@ def main(args):
   # if args.sn:
   #   g_model = add_sn(g_model)
 
-  if args.data_parallel and torch.cuda.device_count() > 1:
-    g_model = nn.DataParallel(g_model)
-  g_model.to(device)
-
   if args.gan_loss != "none":
     d_model = Discriminator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch,
                             img_size=args.vit_img_size, patch_size=args.vit_patch_size,
@@ -217,18 +222,11 @@ def main(args):
     if args.sn:
       d_model = add_sn(d_model)
 
-    if args.data_parallel and torch.cuda.device_count() > 1:
-      d_model = nn.DataParallel(d_model)
-    d_model.to(device)
-
   # loss
   if args.perc_loss != "none":
     norm_mean = torch.tensor([.485, .456, .406]).view(-1, 1, 1).to(device)
     norm_std = torch.tensor([.229, .224, .225]).view(-1, 1, 1).to(device)
-    vgg = VGG19(args.perc_loss).eval()
-    if args.data_parallel and torch.cuda.device_count() > 1:
-      vgg = nn.DataParallel(vgg)
-    vgg.to(device)
+    vgg = VGG19(args.perc_loss).eval().to(device)
 
   mse_criterion = nn.MSELoss()
   train_losses, test_losses = [], []
@@ -241,10 +239,11 @@ def main(args):
     d_optimizer = optim.Adam(d_model.parameters(), lr=args.d_lr,
                              betas=(args.beta1, args.beta2))
 
-  # load checkpoint
+  # load checkpoint (into the raw, pre-accelerator.prepare() model/optimizer)
   if args.resume:
     if os.path.isfile(args.resume):
-      print("=> loading checkpoint {}".format(args.resume))
+      if accelerator.is_main_process:
+        print("=> loading checkpoint {}".format(args.resume))
       checkpoint = torch.load(args.resume)
       args.start_epoch = checkpoint["epoch"]
       g_model.load_state_dict(checkpoint["g_model_state_dict"])
@@ -256,16 +255,29 @@ def main(args):
         g_losses = checkpoint["g_losses"]
       train_losses = checkpoint["train_losses"]
       test_losses = checkpoint["test_losses"]
-      print("=> loaded checkpoint {} (epoch {})"
-          .format(args.resume, checkpoint["epoch"]))
+      if accelerator.is_main_process:
+        print("=> loaded checkpoint {} (epoch {})"
+            .format(args.resume, checkpoint["epoch"]))
+
+  # wrap model(s)/optimizer(s)/dataloaders for distributed training -- this
+  # is what actually enables multi-GPU: DDP-wraps the model(s) and swaps in
+  # a distributed-aware sampler on the dataloaders
+  if args.gan_loss != "none":
+    g_model, d_model, g_optimizer, d_optimizer, train_loader, test_loader = accelerator.prepare(
+        g_model, d_model, g_optimizer, d_optimizer, train_loader, test_loader)
+  else:
+    g_model, g_optimizer, train_loader, test_loader = accelerator.prepare(
+        g_model, g_optimizer, train_loader, test_loader)
 
   # main loop
-  for epoch in tqdm(range(args.start_epoch, args.epochs)):
+  for epoch in tqdm(range(args.start_epoch, args.epochs),
+                    disable=not accelerator.is_main_process):
     # training...
     g_model.train()
     if args.gan_loss != "none":
       d_model.train()
-    train_loss = 0.
+    train_loss = torch.tensor(0., device=device)
+    n_train = torch.tensor(0., device=device)
     for i, sample in enumerate(train_loader):
       image = sample["image"].to(device)
       input_image = sample["input_image"].to(device)
@@ -294,7 +306,7 @@ def main(args):
           d_loss_fake = torch.mean(F.relu(1. + fake_decision))
 
         d_loss = d_loss_real + d_loss_fake
-        d_loss.backward()
+        accelerator.backward(d_loss)
 
         d_optimizer.step()
 
@@ -325,12 +337,15 @@ def main(args):
         perc_loss = mse_criterion(features, fake_features)
         loss += perc_loss
 
-      loss.backward()
+      accelerator.backward(loss)
       g_optimizer.step()
-      train_loss += loss.item() * image.size(0)
+      batch_n = torch.tensor(float(image.size(0)), device=device)
+      train_loss += loss.detach() * batch_n
+      n_train += batch_n
 
-      # log training status
-      if i % args.log_every == 0:
+      # log training status (each process logs its own local batch value;
+      # only rank 0's is actually printed/logged)
+      if i % args.log_every == 0 and accelerator.is_main_process:
         print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
           epoch, i * image.size(0), len(train_loader.dataset),
           100. * i / len(train_loader),
@@ -345,25 +360,31 @@ def main(args):
           g_losses.append(g_loss.item())
         train_losses.append(loss.item())
 
-    print("====> Epoch: {} Average loss: {:.4f}".format(
-      epoch, train_loss / len(train_loader.dataset)))
-    wandb_log({"epoch": epoch,
-              "train/epoch_avg_loss": train_loss / len(train_loader.dataset)})
+    # true cross-process average: gather each process's local sum before dividing
+    train_loss = accelerator.gather_for_metrics(train_loss).sum()
+    n_train = accelerator.gather_for_metrics(n_train).sum()
+    if accelerator.is_main_process:
+      avg_train_loss = (train_loss / n_train).item()
+      print("====> Epoch: {} Average loss: {:.4f}".format(epoch, avg_train_loss))
+      wandb_log({"epoch": epoch, "train/epoch_avg_loss": avg_train_loss})
 
     # testing...
     g_model.eval()
     if args.gan_loss != "none":
       d_model.eval()
-    test_loss = 0.
+    test_loss = torch.tensor(0., device=device)
+    n_test = torch.tensor(0., device=device)
     with torch.no_grad():
       for i, sample in enumerate(test_loader):
         image = sample["image"].to(device)
         input_image = sample["input_image"].to(device)
         vparams = sample["vparams"].to(device)
         fake_image = g_model(input_image, vparams)
-        test_loss += mse_criterion(image, fake_image).item() * image.size(0)
+        batch_n = torch.tensor(float(image.size(0)), device=device)
+        test_loss += mse_criterion(image, fake_image).detach() * batch_n
+        n_test += batch_n
 
-        if i == 0:
+        if i == 0 and accelerator.is_main_process:
           n = min(image.size(0), 8)
           comparison = torch.cat(
               [image[:n], fake_image.view(image.size(0), 3, 256, 256)[:n]])
@@ -371,37 +392,45 @@ def main(args):
                      os.path.join(img_dir, "epoch_{:04d}.png".format(epoch)),
                      nrow=n)
 
-    test_losses.append(test_loss / len(test_loader.dataset))
-    print("====> Epoch: {} Test set loss: {:.4f}".format(
-      epoch, test_losses[-1]))
-    wandb_log({"epoch": epoch, "test/loss": test_losses[-1]})
+    test_loss = accelerator.gather_for_metrics(test_loss).sum()
+    n_test = accelerator.gather_for_metrics(n_test).sum()
+    if accelerator.is_main_process:
+      avg_test_loss = (test_loss / n_test).item()
+      test_losses.append(avg_test_loss)
+      print("====> Epoch: {} Test set loss: {:.4f}".format(epoch, avg_test_loss))
+      wandb_log({"epoch": epoch, "test/loss": avg_test_loss})
 
     # saving...
     if (epoch + 1) % args.check_every == 0 or epoch == args.epochs - 1:
-      print("=> saving checkpoint at epoch {}".format(epoch))
+      accelerator.wait_for_everyone()
+      unwrapped_g = accelerator.unwrap_model(g_model)
       if args.gan_loss != "none":
-        torch.save({"epoch": epoch + 1,
-                    "g_model_state_dict": g_model.state_dict(),
-                    "g_optimizer_state_dict": g_optimizer.state_dict(),
-                    "d_model_state_dict": d_model.state_dict(),
-                    "d_optimizer_state_dict": d_optimizer.state_dict(),
-                    "d_losses": d_losses,
-                    "g_losses": g_losses,
-                    "train_losses": train_losses,
-                    "test_losses": test_losses},
-                   os.path.join(ckpt_dir, "checkpoint_epoch{:04d}.pth.tar".format(epoch)))
-      else:
-        torch.save({"epoch": epoch + 1,
-                    "g_model_state_dict": g_model.state_dict(),
-                    "g_optimizer_state_dict": g_optimizer.state_dict(),
-                    "train_losses": train_losses,
-                    "test_losses": test_losses},
-                   os.path.join(ckpt_dir, "checkpoint_epoch{:04d}.pth.tar".format(epoch)))
+        unwrapped_d = accelerator.unwrap_model(d_model)
+      if accelerator.is_main_process:
+        print("=> saving checkpoint at epoch {}".format(epoch))
+        if args.gan_loss != "none":
+          torch.save({"epoch": epoch + 1,
+                      "g_model_state_dict": unwrapped_g.state_dict(),
+                      "g_optimizer_state_dict": g_optimizer.state_dict(),
+                      "d_model_state_dict": unwrapped_d.state_dict(),
+                      "d_optimizer_state_dict": d_optimizer.state_dict(),
+                      "d_losses": d_losses,
+                      "g_losses": g_losses,
+                      "train_losses": train_losses,
+                      "test_losses": test_losses},
+                     os.path.join(ckpt_dir, "checkpoint_epoch{:04d}.pth.tar".format(epoch)))
+        else:
+          torch.save({"epoch": epoch + 1,
+                      "g_model_state_dict": unwrapped_g.state_dict(),
+                      "g_optimizer_state_dict": g_optimizer.state_dict(),
+                      "train_losses": train_losses,
+                      "test_losses": test_losses},
+                     os.path.join(ckpt_dir, "checkpoint_epoch{:04d}.pth.tar".format(epoch)))
 
-      torch.save(g_model.state_dict(),
-                 os.path.join(ckpt_dir, "generator_epoch{:04d}.pth".format(epoch)))
+        torch.save(unwrapped_g.state_dict(),
+                   os.path.join(ckpt_dir, "generator_epoch{:04d}.pth".format(epoch)))
 
-  if not args.no_wandb:
+  if not args.no_wandb and accelerator.is_main_process:
     wandb.finish()
 
 if __name__ == "__main__":
