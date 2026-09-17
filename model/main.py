@@ -23,7 +23,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 
 from torchvision import transforms
 from ffgs_images import FFGSImageDataset, Normalize, ToTensor
@@ -114,6 +114,9 @@ def parse_args():
                       help="log training status every given number of batches (default: 10)")
   parser.add_argument("--check-every", type=int, default=20,
                       help="save checkpoint every given number of epochs (default: 20)")
+  parser.add_argument("--log-image-freq", type=int, default=100,
+                      help="log a training comparison image every given number "
+                           "of batches (default: 100)")
 
   parser.add_argument("--wandb-project", type=str, default="insitu-net",
                       help="wandb project name (default: insitu-net)")
@@ -144,6 +147,19 @@ def main(args):
   def wandb_log(data):
     if not args.no_wandb and accelerator.is_main_process:
       wandb.log(data)
+
+  def save_comparison_image(path, wandb_key, epoch, gt, pred):
+    # gt/pred are expected in the generator's raw [-1, 1] Tanh output range,
+    # captured before any loss-specific renormalization (e.g. perceptual
+    # loss's ImageNet normalization further down the training loop reassigns
+    # `image`/`fake_image` in place -- callers must snapshot before that).
+    n = min(gt.size(0), 8)
+    comparison = torch.cat([gt[:n], pred.view(gt.size(0), 3, 256, 256)[:n]])
+    # this is used to normalize back from the generator's raw [-1, 1] Tanh output range to image RGB range [0, 1]
+    comparison = ((comparison.cpu() + 1.) * .5).clamp(0, 1)
+    grid = make_grid(comparison, nrow=n)
+    save_image(grid, path)
+    wandb_log({"epoch": epoch, wandb_key: wandb.Image(grid)})
 
   # log hyperparameters
   if accelerator.is_main_process:
@@ -285,6 +301,14 @@ def main(args):
       g_optimizer.zero_grad()
       fake_image = g_model(input_image, vparams)
 
+      # snapshot before the perceptual-loss branch below reassigns
+      # image/fake_image to ImageNet-normalized values in place
+      should_log_images = (accelerator.is_main_process and
+                          i % args.log_image_freq == 0)
+      if should_log_images:
+        vis_image = image.detach()
+        vis_fake_image = fake_image.detach()
+
       loss = 0.
 
       # gan loss
@@ -343,6 +367,11 @@ def main(args):
       train_loss += loss.detach() * batch_n
       n_train += batch_n
 
+      if should_log_images:
+        save_comparison_image(
+            os.path.join(img_dir, "train_epoch{:04d}_iter{:04d}.png".format(epoch, i)),
+            "train/comparison", epoch, vis_image, vis_fake_image)
+
       # log training status (each process logs its own local batch value;
       # only rank 0's is actually printed/logged)
       if i % args.log_every == 0 and accelerator.is_main_process:
@@ -385,12 +414,9 @@ def main(args):
         n_test += batch_n
 
         if i == 0 and accelerator.is_main_process:
-          n = min(image.size(0), 8)
-          comparison = torch.cat(
-              [image[:n], fake_image.view(image.size(0), 3, 256, 256)[:n]])
-          save_image(((comparison.cpu() + 1.) * .5),
-                     os.path.join(img_dir, "epoch_{:04d}.png".format(epoch)),
-                     nrow=n)
+          save_comparison_image(
+              os.path.join(img_dir, "test_epoch_{:04d}.png".format(epoch)),
+              "test/comparison", epoch, image, fake_image)
 
     test_loss = accelerator.gather_for_metrics(test_loss).sum()
     n_test = accelerator.gather_for_metrics(n_test).sum()
