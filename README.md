@@ -91,6 +91,18 @@ accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
 GPUs at the same `--batch-size` multiplies the global batch 8x — `--lr`/
 `--d-lr` likely need scaling up to match, same as any DDP setup.
 
+Sample command for resuming training:
+```bash
+cd model
+accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
+  --root /home/kctung/Projects/FFGS-benchmark/datasets/rendered_images/CQ500_processed_new \
+  --output-dir ../logs/cq500_8gpu \
+  --resume ../logs/cq500_8gpu/checkpoints/checkpoint_epoch0004.pth.tar \
+  --test-scene-fraction 0.1 --scene-split-seed 42 \
+  --batch-size 8 --epochs 10 --check-every 1 --log-every 5 \
+  --perc-loss relu1_2 --mse-loss
+```
+
 ### Legacy: original MPAS parameter-conditioned example
 
 `mpas.py` and the packaged `mpas_sub.zip` sample (100 train / 100 test
