@@ -148,13 +148,18 @@ def main(args):
     if not args.no_wandb and accelerator.is_main_process:
       wandb.log(data)
 
-  def save_comparison_image(path, wandb_key, epoch, gt, pred):
-    # gt/pred are expected in the generator's raw [-1, 1] Tanh output range,
-    # captured before any loss-specific renormalization (e.g. perceptual
-    # loss's ImageNet normalization further down the training loop reassigns
-    # `image`/`fake_image` in place -- callers must snapshot before that).
+  def save_comparison_image(path, wandb_key, epoch, context, gt, pred):
+    # context/gt/pred are expected in the generator's raw [-1, 1] Tanh output
+    # range, captured before any loss-specific renormalization (e.g.
+    # perceptual loss's ImageNet normalization further down the training
+    # loop reassigns `image`/`fake_image` in place -- callers must snapshot
+    # before that). Rows: context (input) / gt (target) / pred (generated).
     n = min(gt.size(0), 8)
-    comparison = torch.cat([gt[:n], pred.view(gt.size(0), 3, 256, 256)[:n]])
+    comparison = torch.cat([
+        context[:n],
+        gt[:n],
+        pred.view(gt.size(0), 3, 256, 256)[:n],
+    ])
     # this is used to normalize back from the generator's raw [-1, 1] Tanh output range to image RGB range [0, 1]
     comparison = ((comparison.cpu() + 1.) * .5).clamp(0, 1)
     grid = make_grid(comparison, nrow=n)
@@ -308,6 +313,7 @@ def main(args):
       if should_log_images:
         vis_image = image.detach()
         vis_fake_image = fake_image.detach()
+        vis_input_image = input_image.detach()
 
       loss = 0.
 
@@ -370,7 +376,7 @@ def main(args):
       if should_log_images:
         save_comparison_image(
             os.path.join(img_dir, "train_epoch{:04d}_iter{:04d}.png".format(epoch, i)),
-            "train/comparison", epoch, vis_image, vis_fake_image)
+            "train/comparison", epoch, vis_input_image, vis_image, vis_fake_image)
 
       # log training status (each process logs its own local batch value;
       # only rank 0's is actually printed/logged)
@@ -416,7 +422,7 @@ def main(args):
         if i == 0 and accelerator.is_main_process:
           save_comparison_image(
               os.path.join(img_dir, "test_epoch_{:04d}.png".format(epoch)),
-              "test/comparison", epoch, image, fake_image)
+              "test/comparison", epoch, input_image, image, fake_image)
 
     test_loss = accelerator.gather_for_metrics(test_loss).sum()
     n_test = accelerator.gather_for_metrics(n_test).sum()

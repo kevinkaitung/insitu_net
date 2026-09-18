@@ -58,10 +58,12 @@ Notes:
   state, `generator_epoch####.pth` with just the generator weights, saved
   every `--check-every` epochs and always on the final epoch) and generated
   comparison images go to `<output-dir>/images/` — one per epoch from the
-  test set (`epoch_####.png`), plus periodic ones from the training set
+  test set (`test_epoch_####.png`), plus periodic ones from the training set
   (`train_epoch####_iter####.png`, every `--log-image-freq` batches,
-  default 100). It's separate from `--root`, which is only ever read as
-  the dataset.
+  default 100). Each is a 3-row grid: context (`input_image`) / target
+  (ground truth) / predicted, so you can see exactly which context view was
+  used for a given target. It's separate from `--root`, which is only ever
+  read as the dataset.
 - Loss curves (train batch/epoch loss, test loss, and D/G loss when GAN loss
   is enabled) *and* the same comparison images (`train/comparison`,
   `test/comparison`) are logged to [wandb](https://wandb.ai) under the
