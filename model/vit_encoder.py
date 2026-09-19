@@ -3,10 +3,14 @@
 # flex-attention, RoPE, and stochastic depth (DropPath) -- none of which
 # apply to InSituNet's single-image-per-sample conditioning use case, and
 # the first of which cannot even be imported under torch==1.13.1 (this
-# repo's pinned version; see requirements.txt). Adds a learned absolute
-# positional embedding, which TokenGS itself does not need (it gets
-# positional info for free from Plucker ray embeddings we are deliberately
-# not porting).
+# repo's pinned version; see requirements.txt).
+#
+# PatchEmbed matches TokenGS's exactly, including its post-projection
+# LayerNorm. TokenGS gets positional information from Plucker ray
+# embeddings summed into the patch tokens (see tokengs/models/tokengs.py's
+# _embed_encoder_input) rather than a learned absolute position table --
+# that ray-embedding step is not yet ported here, so this encoder currently
+# has no positional signal at all until it lands.
 
 import torch
 import torch.nn as nn
@@ -110,59 +114,68 @@ class Block(nn.Module):
     return x
 
 
-def _make_2tuple(x):
+def make_2tuple(x):
   return x if isinstance(x, tuple) else (x, x)
 
 
 class PatchEmbed(nn.Module):
-  """(B, C, H, W) -> (B, N, D)."""
-  def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512):
+  """(B, C, H, W) -> (B, N, D). Exact port of TokenGS's PatchEmbed
+  (tokengs/models/attention.py), reused for both RGB (in_chans=3) and
+  Plucker ray (in_chans=6) patch embedding, matching TokenGS's own
+  patch_embed/patch_plucker_embed pair."""
+  def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
+               norm_layer=None, flatten_embedding=True):
     super().__init__()
-    image_hw = _make_2tuple(img_size)
-    patch_hw = _make_2tuple(patch_size)
+    image_hw = make_2tuple(img_size)
+    patch_hw = make_2tuple(patch_size)
     grid = (image_hw[0] // patch_hw[0], image_hw[1] // patch_hw[1])
 
     self.img_size = image_hw
     self.patch_size = patch_hw
     self.num_patches = grid[0] * grid[1]
+    self.in_chans = in_chans
     self.embed_dim = embed_dim
+    self.flatten_embedding = flatten_embedding
 
     self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_hw, stride=patch_hw)
+    self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
   def forward(self, x):
     _, _, H, W = x.shape
-    ph, pw = self.patch_size
-    assert H % ph == 0 and W % pw == 0, (
-        f"input image size ({H}x{W}) must be divisible by patch size ({ph}x{pw})")
+    patch_H, patch_W = self.patch_size
+    assert H % patch_H == 0, f"Input image height {H} is not a multiple of patch height {patch_H}"
+    assert W % patch_W == 0, f"Input image width {W} is not a multiple of patch width: {patch_W}"
     x = self.proj(x)
-    x = x.flatten(2).transpose(1, 2)  # (B, N, D)
+    H, W = x.size(2), x.size(3)
+    x = x.flatten(2).transpose(1, 2)
+    x = self.norm(x)
+    if not self.flatten_embedding:
+      x = x.reshape(-1, H, W, self.embed_dim)
     return x
 
 
 class ViTImageEncoder(nn.Module):
   """Vendored, simplified ViT encoder for single-image conditioning.
 
-  patch_embed -> learned absolute pos_embed -> stack of Block -> LayerNorm
-  -> pool (mean, for now) -> (B, embed_dim).
+  patch_embed (Conv2d + LayerNorm, matching TokenGS exactly) -> stack of
+  Block -> LayerNorm -> pool (mean, for now) -> (B, embed_dim).
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
-               qk_norm=True, init_values=0.01, norm_layer=nn.LayerNorm):
+               qk_norm=True, init_values=0.01):
     super().__init__()
     self.embed_dim = embed_dim
 
-    self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
-    num_patches = self.patch_embed.num_patches
-
-    self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-    nn.init.trunc_normal_(self.pos_embed, std=0.02)
+    norm_layer_factory = nn.LayerNorm
+    self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim,
+                                  norm_layer=norm_layer_factory)
 
     self.blocks = nn.ModuleList([
         Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias,
-              qk_norm=qk_norm, init_values=init_values, norm_layer=norm_layer)
+              qk_norm=qk_norm, init_values=init_values)
         for _ in range(depth)
     ])
-    self.norm = norm_layer(embed_dim)
+    self.norm = nn.LayerNorm(embed_dim)
 
   def pool(self, x):
     # (B, N, C) -> (B, C). Isolated on purpose: mean-pool for now, swap for
@@ -172,7 +185,6 @@ class ViTImageEncoder(nn.Module):
 
   def forward(self, x):
     x = self.patch_embed(x)
-    x = x + self.pos_embed
     for blk in self.blocks:
       x = blk(x)
     x = self.norm(x)
