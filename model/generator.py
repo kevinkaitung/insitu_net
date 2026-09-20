@@ -60,8 +60,8 @@ class Generator(nn.Module):
       nn.Tanh()
     )
 
-  def forward(self, input_image, vp):
-    img_feat = self.image_encoder(input_image)
+  def forward(self, input_image, plucker, vp):
+    img_feat = self.image_encoder(input_image, plucker)
     img_feat = self.image_proj_subnet(img_feat)
     vp = self.vparams_subnet(vp)
 

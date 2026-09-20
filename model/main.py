@@ -55,6 +55,11 @@ def parse_args():
   parser.add_argument("--scene-split-seed", type=int, default=42,
                       help="random seed for the train/test scene split, "
                            "independent of --seed (default: 42)")
+  parser.add_argument("--num-context-views", type=int, default=6,
+                      help="number of context/input views per sample (default: 6)")
+  parser.add_argument("--scene-scale", type=float, default=1.0,
+                      help="fixed scale factor applied to camera translations "
+                           "(TokenGS's camera_scale_method='constant'; default: 1.0)")
 
   parser.add_argument("--dvp", type=int, default=3,
                       help="dimensions of the view parameters (default: 3)")
@@ -153,10 +158,11 @@ def main(args):
     # range, captured before any loss-specific renormalization (e.g.
     # perceptual loss's ImageNet normalization further down the training
     # loop reassigns `image`/`fake_image` in place -- callers must snapshot
-    # before that). Rows: context (input) / gt (target) / pred (generated).
+    # before that). context is (B, K, 3, H, W) -- one row per context view,
+    # then gt (target) / pred (generated).
     n = min(gt.size(0), 8)
-    comparison = torch.cat([
-        context[:n],
+    context_rows = [context[:n, k] for k in range(context.size(1))]
+    comparison = torch.cat(context_rows + [
         gt[:n],
         pred.view(gt.size(0), 3, 256, 256)[:n],
     ])
@@ -189,12 +195,16 @@ def main(args):
       root=args.root, train=True,
       test_scene_fraction=args.test_scene_fraction,
       scene_split_seed=args.scene_split_seed,
+      num_context_views=args.num_context_views,
+      scene_scale=args.scene_scale,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   test_dataset = FFGSImageDataset(
       root=args.root, train=False,
       test_scene_fraction=args.test_scene_fraction,
       scene_split_seed=args.scene_split_seed,
+      num_context_views=args.num_context_views,
+      scene_scale=args.scene_scale,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   kwargs = {"num_workers": 4, "pin_memory": True, "worker_init_fn": _worker_init_fn}
@@ -302,9 +312,10 @@ def main(args):
     for i, sample in enumerate(train_loader):
       image = sample["image"].to(device)
       input_image = sample["input_image"].to(device)
+      plucker = sample["plucker"].to(device)
       vparams = sample["vparams"].to(device)
       g_optimizer.zero_grad()
-      fake_image = g_model(input_image, vparams)
+      fake_image = g_model(input_image, plucker, vparams)
 
       # snapshot before the perceptual-loss branch below reassigns
       # image/fake_image to ImageNet-normalized values in place
@@ -321,14 +332,14 @@ def main(args):
       if args.gan_loss != "none":
         # update discriminator
         d_optimizer.zero_grad()
-        decision = d_model(input_image, vparams, image)
+        decision = d_model(input_image, plucker, vparams, image)
 
         if args.gan_loss == "vanilla":
           d_loss_real = torch.mean(F.softplus(-decision))
         elif args.gan_loss == "hinge":
           d_loss_real = torch.mean(F.relu(1. - decision))
 
-        fake_decision = d_model(input_image, vparams, fake_image.detach())
+        fake_decision = d_model(input_image, plucker, vparams, fake_image.detach())
 
         if args.gan_loss == "vanilla":
           d_loss_fake = torch.mean(F.softplus(fake_decision))
@@ -342,7 +353,7 @@ def main(args):
 
         # loss of generator
         g_optimizer.zero_grad()
-        fake_decision = d_model(input_image, vparams, fake_image)
+        fake_decision = d_model(input_image, plucker, vparams, fake_image)
 
         if args.gan_loss == "vanilla":
           g_loss = args.gan_loss_weight * torch.mean(F.softplus(-fake_decision))
@@ -413,8 +424,9 @@ def main(args):
       for i, sample in enumerate(test_loader):
         image = sample["image"].to(device)
         input_image = sample["input_image"].to(device)
+        plucker = sample["plucker"].to(device)
         vparams = sample["vparams"].to(device)
-        fake_image = g_model(input_image, vparams)
+        fake_image = g_model(input_image, plucker, vparams)
         batch_n = torch.tensor(float(image.size(0)), device=device)
         test_loss += mse_criterion(image, fake_image).detach() * batch_n
         n_test += batch_n

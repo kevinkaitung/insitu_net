@@ -72,8 +72,8 @@ class Discriminator(nn.Module):
       nn.Linear(ch * 16, 1)
     )
 
-  def forward(self, input_image, vp, x):
-    img_feat = self.image_encoder(input_image)
+  def forward(self, input_image, plucker, vp, x):
+    img_feat = self.image_encoder(input_image, plucker)
     img_feat = self.image_proj_subnet(img_feat)
     vp = self.vparams_subnet(vp)
 

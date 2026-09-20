@@ -155,10 +155,14 @@ class PatchEmbed(nn.Module):
 
 
 class ViTImageEncoder(nn.Module):
-  """Vendored, simplified ViT encoder for single-image conditioning.
+  """Vendored, simplified ViT encoder for multi-view image conditioning.
 
-  patch_embed (Conv2d + LayerNorm, matching TokenGS exactly) -> stack of
-  Block -> LayerNorm -> pool (mean, for now) -> (B, embed_dim).
+  patch_embed(rgb) + patch_plucker_embed(plucker) -> joint sequence over
+  all views' patches -> stack of Block -> LayerNorm -> pool (mean, for
+  now) -> (B, embed_dim). Matches TokenGS's tokengs.py _embed_encoder_input
+  (patchify each view independently, concatenate into one joint sequence
+  so patches from different views can attend to each other) + enc_dec.py's
+  EncDecBackbone.encoder/encoder_norm.
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
@@ -169,6 +173,8 @@ class ViTImageEncoder(nn.Module):
     norm_layer_factory = nn.LayerNorm
     self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim,
                                   norm_layer=norm_layer_factory)
+    self.patch_plucker_embed = PatchEmbed(img_size, patch_size, 6, embed_dim,
+                                          norm_layer=norm_layer_factory)
 
     self.blocks = nn.ModuleList([
         Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias,
@@ -183,8 +189,16 @@ class ViTImageEncoder(nn.Module):
     # as a later follow-up without touching anything else in this class.
     return x.mean(dim=1)
 
-  def forward(self, x):
-    x = self.patch_embed(x)
+  def forward(self, x, plucker):
+    # x: (B, K, 3, H, W) -- K context views. plucker: (B, K, 6, H, W).
+    B, K, C_in, H, W = x.shape
+    x = x.reshape(B * K, C_in, H, W)
+    plucker = plucker.reshape(B * K, plucker.shape[2], H, W)
+
+    x = self.patch_embed(x) + self.patch_plucker_embed(plucker)  # (B*K, N, C)
+    N, C = x.shape[1], x.shape[2]
+    x = x.reshape(B, K * N, C)  # joint sequence over all K views' patches
+
     for blk in self.blocks:
       x = blk(x)
     x = self.norm(x)
