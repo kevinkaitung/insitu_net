@@ -73,17 +73,43 @@ def _plucker_embedding(c2w, fx, fy, cx, cy, H, W):
   return plucker.transpose(2, 0, 1).astype(np.float32)  # (6, H, W)
 
 
+def _sample_context_and_target(rng, num_views, num_context_views, min_gap, max_gap):
+  # Port of methods/TokenGS/tokengs/data/provider.py's
+  # Provider._get_indices_static (lines 281-296), generalized for exactly
+  # one target per sample (TokenGS's num_views - num_input_views, always 1
+  # here). Both context and target are drawn from one shared, randomly
+  # sized and positioned window of view indices -- not from the whole
+  # scene -- exactly mirroring TokenGS's own algorithm, even though (as
+  # discussed) CQ500's view ordering has no real spatial/temporal locality
+  # the way DL3DV's video frame ordering does; this is intentionally
+  # ported as-is for consistency with how TokenGS was actually trained on
+  # this dataset.
+  #
+  # `rng` is a random.Random-compatible object (either Python's global
+  # `random` module for training -- a shared, continuously-advancing
+  # sequence, different every epoch -- or a random.Random(index) instance
+  # for eval, giving the same window/context/target every time a given
+  # scene index is evaluated, mirroring TokenGS's get_rng()'s eval branch).
+  context_gap = rng.randint(min_gap, max_gap)
+  context_gap = max(min(num_views - 1, context_gap), num_context_views - 1)
+  start_frame = rng.randint(0, num_views - context_gap - 1)
+
+  between = list(range(start_frame + 1, start_frame + context_gap))
+  rng.shuffle(between)
+  inbetween_idx = sorted(between[:num_context_views - 2])
+  context_idx = [start_frame] + inbetween_idx + [start_frame + context_gap]
+
+  window = list(range(start_frame, start_frame + context_gap + 1))
+  rng.shuffle(window)
+  target_idx = window[0]
+
+  return context_idx, target_idx
+
+
 def _load_transforms(root, scene):
   transforms_path = os.path.join(root, scene, "gaussian_splat", "transforms.json")
   with open(transforms_path) as f:
     return json.load(f)
-
-
-def _count_views(root, scene):
-  # Only reads the frame count and discards the rest -- called once per
-  # scene at dataset construction, just to build the flat (scene, view_idx)
-  # index below. The full transforms.json is re-read in __getitem__.
-  return len(_load_transforms(root, scene)["frames"])
 
 
 def _load_scene(root, scene):
@@ -116,34 +142,37 @@ class FFGSImageDataset(Dataset):
   per-scene volume-rendered views (see
   datasets/rendered_images/CQ500_processed_new).
 
-  Each scene subfolder under `root` is expected to contain:
-    <scene>/gaussian_splat/transforms.json  (frames: file_path, transform_matrix)
-    <scene>/gaussian_splat/images/*.jpg
+  One dataset entry per *scene* (not per view) -- matching TokenGS's own
+  Provider.__len__ (== number of scenes) exactly, rather than enumerating
+  every view. Each access draws one fresh, randomly-windowed sample from
+  that scene: `num_context_views` context images (the model's input) and
+  one target image (what the model predicts), both drawn from a shared
+  random window of view indices via _sample_context_and_target (a direct
+  port of TokenGS's Provider._get_indices_static).
 
-  Each sample has `num_context_views` context images (the model's input)
-  and one target image (what the model predicts). Camera poses are
-  converted to OpenCV convention (_to_opencv_convention, matching
-  TokenGS's DL3DV10K.load_cameras exactly) and recentered relative to the
-  first context view (_recenter_c2w, TokenGS's first_cam normalization),
-  so `vparams` (the target's recentered translation) means "where the
-  target is, relative to wherever the first context view was taken from."
-  Translations are scaled by a fixed, user-provided `scene_scale` (no
-  per-scene auto-computation -- matches TokenGS's camera_scale_method=
-  'constant', which is what it uses for most presets).
+  Camera poses are converted to OpenCV convention (_to_opencv_convention,
+  matching TokenGS's DL3DV10K.load_cameras exactly) and recentered
+  relative to the first context view (_recenter_c2w, TokenGS's first_cam
+  normalization), so `vparams` (the target's recentered translation) means
+  "where the target is, relative to wherever the first context view was
+  taken from." Translations are scaled by a fixed, user-provided
+  `scene_scale` (no per-scene auto-computation -- matches TokenGS's
+  camera_scale_method='constant', which is what it uses for most presets).
 
   Loads lazily from disk, following methods/TokenGS's tokengs/data/static/
-  dl3dv.py (DL3DV10K): __init__ only discovers scene paths and each
-  scene's view count (one cheap transforms.json parse per scene, nothing
-  retained beyond the count); every other per-scene value is recomputed
-  fresh in __getitem__ on every access, same as dl3dv.py's get_data().
+  dl3dv.py (DL3DV10K): __init__ only discovers scene paths; every other
+  per-scene value is recomputed fresh in __getitem__ on every access, same
+  as dl3dv.py's get_data().
   """
   def __init__(self, root, train=True, test_scene_fraction=0.1,
                scene_split_seed=42, num_context_views=6, scene_scale=1.0,
-               transform=None):
+               min_view_gap=10, max_view_gap=25, transform=None):
     self.root = root
     self.train = train
     self.num_context_views = num_context_views
     self.scene_scale = scene_scale
+    self.min_view_gap = min_view_gap
+    self.max_view_gap = max_view_gap
     self.transform = transform
 
     all_scenes = _discover_scenes(root)
@@ -151,30 +180,26 @@ class FFGSImageDataset(Dataset):
         all_scenes, test_scene_fraction, scene_split_seed)
     self.scenes = train_scenes if train else test_scenes
 
-    self._index = []
-    for scene in self.scenes:
-      n_views = _count_views(root, scene)
-      self._index.extend((scene, i) for i in range(n_views))
-
   def __len__(self):
-    return len(self._index)
+    return len(self.scenes)
 
   def __getitem__(self, index):
     if torch.is_tensor(index):
       index = index.item()
-    scene, target_idx = self._index[index]
+    scene = self.scenes[index]
     file_paths, transform_matrices, (fx, fy, cx, cy, w, h) = _load_scene(self.root, scene)
     num_views = len(file_paths)
     K = self.num_context_views
 
-    candidates = [j for j in range(num_views) if j != target_idx]
-    if self.train:
-      input_idx = random.sample(candidates, K)
-    else:
-      # Placeholder deterministic rule -- distinct from the manual,
-      # per-scene context-view selection discussed for eval (mirroring
-      # TokenGS's evaluation_idx_*.json), which is a separate follow-up.
-      input_idx = [(target_idx + num_views // 2 + k) % num_views for k in range(K)]
+    # Train: Python's global `random` module, a shared sequence that keeps
+    # advancing across the whole epoch (and across epochs) -- a different
+    # window every time a scene is visited. Eval: a fresh, index-seeded
+    # RNG, so the same scene index always gets the same window/context/
+    # target across separate evaluation runs (mirrors TokenGS's
+    # get_rng()'s eval branch: np.random.default_rng(seed + idx)).
+    rng = random if self.train else random.Random(index)
+    input_idx, target_idx = _sample_context_and_target(
+        rng, num_views, K, self.min_view_gap, self.max_view_gap)
 
     image = io.imread(file_paths[target_idx])[:, :, 0:3]
     input_image = np.stack([io.imread(file_paths[i])[:, :, 0:3] for i in input_idx])
