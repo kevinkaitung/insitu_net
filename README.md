@@ -89,7 +89,7 @@ accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
   --output-dir ../logs/cq500_8gpu \
   --test-scene-fraction 0.1 --scene-split-seed 42 \
   --batch-size 8 --epochs 5 --check-every 1 --log-every 5 \
-  --perc-loss relu1_2 --mse-loss
+  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 # for CQ500 dataset
 ```
 
 `--batch-size` is **per-GPU**: the effective global batch size scales with
@@ -106,7 +106,7 @@ accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
   --resume ../logs/cq500_8gpu/checkpoints/checkpoint_epoch0004.pth.tar \
   --test-scene-fraction 0.1 --scene-split-seed 42 \
   --batch-size 8 --epochs 10 --check-every 1 --log-every 5 \
-  --perc-loss relu1_2 --mse-loss
+  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 # for CQ500 dataset
 ```
 
 ### Legacy: original MPAS parameter-conditioned example
