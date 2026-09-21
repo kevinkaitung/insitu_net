@@ -89,8 +89,11 @@ accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
   --output-dir ../logs/cq500_8gpu \
   --test-scene-fraction 0.1 --scene-split-seed 42 \
   --batch-size 8 --epochs 5 --check-every 1 --log-every 5 \
-  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 # for CQ500 dataset
+  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 \
+  --tokengs-checkpoint /home/kctung/Projects/tokengs-private/workspace/9.8.lambert.train.set.only/sophia_finetune_run/model.safetensors \
+  --freeze-vit-encoder
 ```
+**NOTE:** 0.001 as scene-scale is emperically found working for CQ500 dataset in TokenGS training
 
 `--batch-size` is **per-GPU**: the effective global batch size scales with
 `num_processes` in the chosen `acc_configs/*.yaml`, so going from 1 to 8
@@ -106,7 +109,9 @@ accelerate launch --config_file ../acc_configs/gpu8.yaml main.py \
   --resume ../logs/cq500_8gpu/checkpoints/checkpoint_epoch0004.pth.tar \
   --test-scene-fraction 0.1 --scene-split-seed 42 \
   --batch-size 8 --epochs 10 --check-every 1 --log-every 5 \
-  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 # for CQ500 dataset
+  --perc-loss relu1_2 --mse-loss --scene-scale 0.001 \
+  --tokengs-checkpoint /home/kctung/Projects/tokengs-private/workspace/9.8.lambert.train.set.only/sophia_finetune_run/model.safetensors \
+  --freeze-vit-encoder
 ```
 
 ### Legacy: original MPAS parameter-conditioned example

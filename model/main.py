@@ -120,6 +120,15 @@ def parse_args():
                            "the checkpoint itself and override the corresponding "
                            "flags above. If not given, the ViT encoder trains "
                            "from scratch (default: none)")
+  parser.add_argument("--freeze-vit-encoder", action="store_true", default=False,
+                      help="freeze the ViT image encoder (patch_embed, "
+                           "patch_plucker_embed, blocks, multiscale_norms -- "
+                           "everything before pooling, which has no weights of "
+                           "its own) so it's excluded from the optimizer and "
+                           "never updated during training. Meant to be paired "
+                           "with --tokengs-checkpoint, so TokenGS and InSituNet "
+                           "are compared using the exact same encoder weights "
+                           "(default: False)")
 
   parser.add_argument("--sn", action="store_true", default=False,
                       help="enable spectral normalization")
@@ -341,6 +350,25 @@ def main(args):
             .format(args.tokengs_checkpoint,
                     " and d_model" if args.gan_loss != "none" else ""))
 
+  # Freeze the ViT image encoder (patch_embed, patch_plucker_embed, blocks,
+  # multiscale_norms -- pool() has no parameters of its own, so this covers
+  # everything before it) so TokenGS and InSituNet are compared using the
+  # exact same, un-fine-tuned encoder weights. requires_grad=False here is
+  # also what keeps these params out of the optimizer below and out of
+  # DDP's gradient sync once accelerator.prepare() wraps the model.
+  if args.freeze_vit_encoder:
+    if not args.tokengs_checkpoint and accelerator.is_main_process:
+      print("=> WARNING: --freeze-vit-encoder with no --tokengs-checkpoint "
+            "freezes a randomly-initialized encoder for the entire run")
+    for p in g_model.image_encoder.parameters():
+      p.requires_grad = False
+    if args.gan_loss != "none":
+      for p in d_model.image_encoder.parameters():
+        p.requires_grad = False
+    if accelerator.is_main_process:
+      print("=> froze g_model.image_encoder{}".format(
+          " and d_model.image_encoder" if args.gan_loss != "none" else ""))
+
   # loss
   if args.perc_loss != "none":
     norm_mean = torch.tensor([.485, .456, .406]).view(-1, 1, 1).to(device)
@@ -351,12 +379,14 @@ def main(args):
   train_losses, test_losses = [], []
   d_losses, g_losses = [], []
 
-  # optimizer
-  g_optimizer = optim.Adam(g_model.parameters(), lr=args.lr,
-                           betas=(args.beta1, args.beta2))
+  # optimizer -- filtered to trainable params only, so a frozen image_encoder
+  # (see --freeze-vit-encoder above) is excluded rather than just carried
+  # along with permanently-None gradients
+  g_optimizer = optim.Adam(filter(lambda p: p.requires_grad, g_model.parameters()),
+                           lr=args.lr, betas=(args.beta1, args.beta2))
   if args.gan_loss != "none":
-    d_optimizer = optim.Adam(d_model.parameters(), lr=args.d_lr,
-                             betas=(args.beta1, args.beta2))
+    d_optimizer = optim.Adam(filter(lambda p: p.requires_grad, d_model.parameters()),
+                             lr=args.d_lr, betas=(args.beta1, args.beta2))
 
   # load checkpoint (into the raw, pre-accelerator.prepare() model/optimizer)
   if args.resume:
