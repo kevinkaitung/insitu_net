@@ -166,9 +166,17 @@ class ViTImageEncoder(nn.Module):
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
-               qk_norm=True, init_values=0.01):
+               qk_norm=True, init_values=0.01, multiscale_layers=(5, 7, 9, 11)):
     super().__init__()
-    self.embed_dim = embed_dim
+    # Port of TokenGS's EncDecBackbone.use_multiscale=True path
+    # (tokengs/models/enc_dec.py's _encode_features): rather than a single
+    # LayerNorm on the last block's output, snapshot+LayerNorm the running
+    # sequence at each index in `multiscale_layers` (without feeding those
+    # snapshots back into the residual stream -- every block still only
+    # ever sees the previous block's raw output) and concatenate the
+    # snapshots channel-wise. embed_dim below ends up
+    # embed_dim * len(multiscale_layers) accordingly.
+    self.multiscale_layers = tuple(multiscale_layers)
 
     norm_layer_factory = nn.LayerNorm
     self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim,
@@ -181,7 +189,10 @@ class ViTImageEncoder(nn.Module):
               qk_norm=qk_norm, init_values=init_values)
         for _ in range(depth)
     ])
-    self.norm = nn.LayerNorm(embed_dim)
+    self.multiscale_norms = nn.ModuleList([
+        nn.LayerNorm(embed_dim) for _ in self.multiscale_layers
+    ])
+    self.embed_dim = embed_dim * len(self.multiscale_layers)
 
   def pool(self, x):
     # (B, N, C) -> (B, C). Isolated on purpose: mean-pool for now, swap for
@@ -199,7 +210,10 @@ class ViTImageEncoder(nn.Module):
     N, C = x.shape[1], x.shape[2]
     x = x.reshape(B, K * N, C)  # joint sequence over all K views' patches
 
-    for blk in self.blocks:
+    features = []
+    for i, blk in enumerate(self.blocks):
       x = blk(x)
-    x = self.norm(x)
+      if i in self.multiscale_layers:
+        features.append(self.multiscale_norms[len(features)](x))
+    x = torch.cat(features, dim=-1)  # (B, K*N, C * len(multiscale_layers))
     return self.pool(x)

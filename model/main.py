@@ -95,6 +95,7 @@ def parse_args():
   parser.add_argument("--vit-init-values", type=float, default=0.01,
                       help="LayerScale init value in the ViT image encoder; "
                            "pass 0 to disable LayerScale (default: 0.01)")
+  #TODO: miss arguments to control whether using multiscale encoder and specifying multiscale_layers
 
   parser.add_argument("--sn", action="store_true", default=False,
                       help="enable spectral normalization")
