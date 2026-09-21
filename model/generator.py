@@ -16,7 +16,7 @@ class Generator(nn.Module):
   def __init__(self, dvp=3, dvpe=512, dife=512, ch=64,
                img_size=256, patch_size=16, vit_embed_dim=512, vit_depth=4,
                vit_num_heads=8, vit_mlp_ratio=4.0, vit_qk_norm=True,
-               vit_init_values=0.01):
+               vit_init_values=0.01, vit_multiscale_layers=(5, 7, 9, 11)):
     super(Generator, self).__init__()
 
     self.dvp, self.dvpe = dvp, dvpe
@@ -27,7 +27,8 @@ class Generator(nn.Module):
     self.image_encoder = ViTImageEncoder(
       img_size=img_size, patch_size=patch_size, embed_dim=vit_embed_dim,
       depth=vit_depth, num_heads=vit_num_heads, mlp_ratio=vit_mlp_ratio,
-      qk_norm=vit_qk_norm, init_values=vit_init_values
+      qk_norm=vit_qk_norm, init_values=vit_init_values,
+      multiscale_layers=vit_multiscale_layers
     )
     self.image_proj_subnet = nn.Sequential(
       nn.Linear(self.image_encoder.embed_dim, dife), nn.ReLU(),

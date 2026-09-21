@@ -31,6 +31,8 @@ from ffgs_images import FFGSImageDataset, Normalize, ToTensor
 from generator import Generator
 from discriminator import Discriminator
 from vgg19 import VGG19
+from load_tokengs_encoder import infer_encoder_hparams, load_pretrained_tokengs_encoder
+from safetensors import safe_open
 
 # parse arguments
 def parse_args():
@@ -84,7 +86,7 @@ def parse_args():
                       help="patch size for the ViT image encoder (default: 16)")
   parser.add_argument("--vit-embed-dim", type=int, default=512,
                       help="embedding dim of the ViT image encoder (default: 512)")
-  parser.add_argument("--vit-depth", type=int, default=4,
+  parser.add_argument("--vit-depth", type=int, default=12,
                       help="number of transformer blocks in the ViT image encoder (default: 4)")
   parser.add_argument("--vit-num-heads", type=int, default=8,
                       help="number of attention heads in the ViT image encoder (default: 8)")
@@ -95,7 +97,29 @@ def parse_args():
   parser.add_argument("--vit-init-values", type=float, default=0.01,
                       help="LayerScale init value in the ViT image encoder; "
                            "pass 0 to disable LayerScale (default: 0.01)")
-  #TODO: miss arguments to control whether using multiscale encoder and specifying multiscale_layers
+  parser.add_argument("--vit-use-multiscale", action="store_true", default=True,
+                      help="use TokenGS's multiscale encoder (concatenate "
+                           "LayerNorm'd snapshots at --vit-multiscale-layers "
+                           "instead of a single final norm); default: True, "
+                           "matching every known TokenGS config")
+  parser.add_argument("--no-vit-use-multiscale", dest="vit_use_multiscale",
+                      action="store_false",
+                      help="disable the multiscale encoder -- falls back to "
+                           "a single LayerNorm snapshot at the last block")
+  parser.add_argument("--vit-multiscale-layers", type=int, nargs="+", default=[5, 7, 9, 11],
+                      help="block indices to snapshot+concatenate when "
+                           "--vit-use-multiscale is set (default: 5 7 9 11, "
+                           "TokenGS's own default; ignored otherwise)")
+
+  parser.add_argument("--tokengs-checkpoint", type=str, default="",
+                      help="path to a pretrained TokenGS safetensors checkpoint "
+                           "to initialize the ViT image encoder (patch_embed, "
+                           "patch_plucker_embed, blocks, multiscale_norms) from. "
+                           "--vit-patch-size/--vit-embed-dim/--vit-depth/"
+                           "--vit-num-heads/--vit-mlp-ratio are inferred from "
+                           "the checkpoint itself and override the corresponding "
+                           "flags above. If not given, the ViT encoder trains "
+                           "from scratch (default: none)")
 
   parser.add_argument("--sn", action="store_true", default=False,
                       help="enable spectral normalization")
@@ -243,26 +267,79 @@ def main(args):
     else:
       return m
 
-  g_model = Generator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch,
-                      img_size=args.vit_img_size, patch_size=args.vit_patch_size,
-                      vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
-                      vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
-                      vit_qk_norm=not args.no_vit_qk_norm,
-                      vit_init_values=args.vit_init_values)
+  # ViT image-encoder hyperparameters: when --tokengs-checkpoint is given,
+  # --vit-patch-size/--vit-embed-dim/--vit-depth/--vit-num-heads/
+  # --vit-mlp-ratio/--vit-init-values are overridden by what that checkpoint's
+  # own tensor shapes actually require (see load_tokengs_encoder.py) --
+  # img_size and multiscale_layers can't be recovered from a checkpoint (no
+  # tensor shape depends on either), so those stay CLI-driven either way.
+  vit_kwargs = dict(img_size=args.vit_img_size, patch_size=args.vit_patch_size,
+                    vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
+                    vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
+                    vit_qk_norm=not args.no_vit_qk_norm,
+                    vit_init_values=args.vit_init_values)
+
+  if args.tokengs_checkpoint:
+    with safe_open(args.tokengs_checkpoint, framework="pt") as f:
+      shapes = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
+    inferred = infer_encoder_hparams(shapes)
+    inferred.pop("num_multiscale")
+    if accelerator.is_main_process:
+      print("=> inferring ViT encoder hyperparameters from --tokengs-checkpoint "
+            "{}: {} (overrides --vit-patch-size/--vit-embed-dim/--vit-depth/"
+            "--vit-num-heads/--vit-mlp-ratio/--vit-init-values/--no-vit-qk-norm)"
+            .format(args.tokengs_checkpoint, inferred))
+    vit_kwargs.update(patch_size=inferred["patch_size"],
+                      vit_embed_dim=inferred["embed_dim"],
+                      vit_depth=inferred["depth"],
+                      vit_num_heads=inferred["num_heads"],
+                      vit_mlp_ratio=inferred["mlp_ratio"],
+                      vit_qk_norm=inferred["qk_norm"],
+                      vit_init_values=inferred["init_values"])
+
+  vit_multiscale_layers = (tuple(args.vit_multiscale_layers) if args.vit_use_multiscale
+                           else (vit_kwargs["vit_depth"] - 1,))
+  if max(vit_multiscale_layers) >= vit_kwargs["vit_depth"]:
+    raise ValueError(
+        "--vit-multiscale-layers {} has an index out of range for "
+        "--vit-depth {} (block indices are 0..depth-1); this combination "
+        "would give the ViT encoder's forward pass zero snapshots to "
+        "concatenate. --vit-multiscale-layers' default (5, 7, 9, 11) needs "
+        "--vit-depth >= 12 (or --tokengs-checkpoint, which infers the "
+        "correct depth), or pass --no-vit-use-multiscale / matching "
+        "--vit-multiscale-layers for a shallower encoder."
+        .format(list(vit_multiscale_layers), vit_kwargs["vit_depth"]))
+  vit_kwargs["vit_multiscale_layers"] = vit_multiscale_layers
+
+  g_model = Generator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch, **vit_kwargs)
   g_model.apply(weights_init)
   # if args.sn:
   #   g_model = add_sn(g_model)
 
   if args.gan_loss != "none":
-    d_model = Discriminator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch,
-                            img_size=args.vit_img_size, patch_size=args.vit_patch_size,
-                            vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
-                            vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
-                            vit_qk_norm=not args.no_vit_qk_norm,
-                            vit_init_values=args.vit_init_values)
+    d_model = Discriminator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch, **vit_kwargs)
     d_model.apply(weights_init)
     if args.sn:
       d_model = add_sn(d_model)
+
+  # warm-start the ViT encoder(s) from a pretrained TokenGS checkpoint --
+  # after weights_init (which would otherwise overwrite this with a fresh
+  # orthogonal init) and before --resume below (--resume, if also given,
+  # still takes precedence: it fully overwrites both models afterward,
+  # including the encoder, since it represents further-along InSituNet
+  # training state rather than just a starting point)
+  if args.tokengs_checkpoint:
+    missing, unexpected = load_pretrained_tokengs_encoder(
+        g_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers)
+    assert not missing and not unexpected, (missing, unexpected)
+    if args.gan_loss != "none":
+      missing, unexpected = load_pretrained_tokengs_encoder(
+          d_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers)
+      assert not missing and not unexpected, (missing, unexpected)
+    if accelerator.is_main_process:
+      print("=> loaded pretrained TokenGS encoder from {} into g_model{}"
+            .format(args.tokengs_checkpoint,
+                    " and d_model" if args.gan_loss != "none" else ""))
 
   # loss
   if args.perc_loss != "none":
