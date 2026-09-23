@@ -110,7 +110,8 @@ def parse_args():
                       help="block indices to snapshot+concatenate when "
                            "--vit-use-multiscale is set (default: 5 7 9 11, "
                            "TokenGS's own default; ignored otherwise)")
-  parser.add_argument("--vit-pool-mode", type=str, default="mean", choices=["mean", "concat"],
+  parser.add_argument("--vit-pool-mode", type=str, default="mean",
+                      choices=["mean", "concat", "proj_and_concat"],
                       help="how the ViT encoder's per-token features collapse "
                            "into one vector: 'mean' averages over every patch "
                            "token (parameter-free, works for any number of "
@@ -119,14 +120,27 @@ def parse_args():
                            "result to --vit-concat-pool-dim -- this fixes the "
                            "encoder to exactly --num-context-views views, and "
                            "the projection layer's parameter count scales as "
+                           "num_context_views * patches_per_view * embed_dim * "
+                           "len(multiscale_layers), which gets very large very "
+                           "fast; 'proj_and_concat' first applies one shared "
+                           "Linear (same weights for every patch token, à la "
+                           "PatchEmbed/PointNet) down to --vit-token-proj-dim, "
+                           "then flattens -- also fixes the encoder to exactly "
+                           "--num-context-views views, but the flatten is on "
                            "num_context_views * patches_per_view * "
-                           "embed_dim * len(multiscale_layers), which gets "
-                           "very large very fast (default: mean)")
+                           "vit_token_proj_dim, avoiding 'concat's blowup "
+                           "(default: mean)")
   parser.add_argument("--vit-concat-pool-dim", type=int, default=512,
                       help="output dim of the concat-pooling projection "
                            "Linear layer, i.e. what the rest of InSituNet "
                            "consumes as the image feature; only used when "
                            "--vit-pool-mode=concat (default: 512)")
+  parser.add_argument("--vit-token-proj-dim", type=int, default=4,
+                      help="output dim of the shared per-token projection "
+                           "Linear layer when --vit-pool-mode=proj_and_concat "
+                           "(the flattened/concatenated feature InSituNet "
+                           "consumes ends up num_context_views * "
+                           "patches_per_view * this; default: 4)")
 
   parser.add_argument("--tokengs-checkpoint", type=str, default="",
                       help="path to a pretrained TokenGS safetensors checkpoint "
@@ -339,23 +353,38 @@ def main(args):
   vit_kwargs["vit_pool_mode"] = args.vit_pool_mode
   vit_kwargs["vit_num_context_views"] = args.num_context_views
   vit_kwargs["vit_concat_pool_dim"] = args.vit_concat_pool_dim
+  vit_kwargs["vit_token_proj_dim"] = args.vit_token_proj_dim
 
+  per_token_dim = vit_kwargs["vit_embed_dim"] * len(vit_multiscale_layers)
+  num_tokens = args.num_context_views * (vit_kwargs["img_size"] // vit_kwargs["patch_size"]) ** 2
   if args.vit_pool_mode == "concat":
-    num_tokens = args.num_context_views * (vit_kwargs["img_size"] // vit_kwargs["patch_size"]) ** 2
-    flatten_dim = num_tokens * vit_kwargs["vit_embed_dim"] * len(vit_multiscale_layers)
+    flatten_dim = num_tokens * per_token_dim
     n_proj_params = flatten_dim * args.vit_concat_pool_dim
     if accelerator.is_main_process:
       print("=> --vit-pool-mode=concat: concat_pool_proj is Linear({}, {}) "
             "= {:.2f}B parameters ({:.1f} GiB in fp32)"
             .format(flatten_dim, args.vit_concat_pool_dim,
                     n_proj_params / 1e9, n_proj_params * 4 / 2**30))
+  elif args.vit_pool_mode == "proj_and_concat":
+    n_proj_params = per_token_dim * args.vit_token_proj_dim + args.vit_token_proj_dim
+    output_dim = num_tokens * args.vit_token_proj_dim
+    if accelerator.is_main_process:
+      print("=> --vit-pool-mode=proj_and_concat: token_proj is Linear({}, {}) "
+            "= {:,} parameters (shared across all {} tokens), flattened "
+            "output dim {:,}"
+            .format(per_token_dim, args.vit_token_proj_dim, n_proj_params,
+                    num_tokens, output_dim))
 
-  # concat_pool_proj (if --vit-pool-mode=concat) has no TokenGS counterpart --
-  # TokenGS has no pooling layer of its own at all, that's entirely
-  # InSituNet's own addition -- so it always loads with its own random init
-  # rather than from the checkpoint.
-  encoder_allow_missing = (("concat_pool_proj.weight", "concat_pool_proj.bias")
-                           if args.vit_pool_mode == "concat" else ())
+  # concat_pool_proj/token_proj (depending on --vit-pool-mode) have no
+  # TokenGS counterpart -- TokenGS has no pooling layer of its own at all,
+  # that's entirely InSituNet's own addition -- so they always load with
+  # their own random init rather than from the checkpoint.
+  if args.vit_pool_mode == "concat":
+    encoder_allow_missing = ("concat_pool_proj.weight", "concat_pool_proj.bias")
+  elif args.vit_pool_mode == "proj_and_concat":
+    encoder_allow_missing = ("token_proj.weight", "token_proj.bias")
+  else:
+    encoder_allow_missing = ()
 
   g_model = Generator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch, **vit_kwargs)
   g_model.apply(weights_init)

@@ -171,12 +171,20 @@ class ViTImageEncoder(nn.Module):
   to `concat_pool_dim` -- unlike mean pooling this needs a *fixed* T, so
   `num_context_views` must be given and every forward() call must use
   exactly that many views. T*C is typically enormous (see the assert in
-  __init__), so this is meant for deliberately small configs.
+  __init__), so this is meant for deliberately small configs. "proj_and_concat"
+  is a cheaper middle ground: a single shared Linear(C, token_proj_dim),
+  applied identically and independently to every one of the T tokens (the
+  same weight-tying principle as PatchEmbed's own per-patch projection --
+  Deep Sets/PointNet's "shared per-element transform, then aggregate"),
+  then flattening the small per-token outputs into (T*token_proj_dim,).
+  Also needs a fixed T (num_context_views), but the flatten is on
+  T*token_proj_dim instead of T*C, avoiding "concat"'s blowup.
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
                qk_norm=True, init_values=0.01, multiscale_layers=(5, 7, 9, 11),
-               pool_mode="mean", num_context_views=None, concat_pool_dim=512):
+               pool_mode="mean", num_context_views=None, concat_pool_dim=512,
+               token_proj_dim=4):
     super().__init__()
     # Port of TokenGS's EncDecBackbone.use_multiscale=True path
     # (tokengs/models/enc_dec.py's _encode_features): rather than a single
@@ -215,10 +223,18 @@ class ViTImageEncoder(nn.Module):
       flatten_dim = num_tokens * per_token_dim
       self.concat_pool_proj = nn.Linear(flatten_dim, concat_pool_dim)
       self.embed_dim = concat_pool_dim
+    elif pool_mode == "proj_and_concat":
+      assert num_context_views is not None, (
+          "num_context_views is required when pool_mode='proj_and_concat' -- "
+          "the concatenated output size depends on the total token count")
+      self.token_proj = nn.Linear(per_token_dim, token_proj_dim)
+      num_tokens = num_context_views * self.patch_embed.num_patches
+      self.embed_dim = num_tokens * token_proj_dim
     elif pool_mode == "mean":
       self.embed_dim = per_token_dim
     else:
-      raise ValueError(f"unknown pool_mode {pool_mode!r}, expected 'mean' or 'concat'")
+      raise ValueError(f"unknown pool_mode {pool_mode!r}, expected 'mean', "
+                       "'concat', or 'proj_and_concat'")
 
   def pool(self, x):
     # x: (B, T, C) -- T = num_context_views * patches-per-view, C = embed_dim
@@ -227,16 +243,20 @@ class ViTImageEncoder(nn.Module):
     if self.pool_mode == "concat":
       B, T, C = x.shape
       return self.concat_pool_proj(x.reshape(B, T * C))
+    if self.pool_mode == "proj_and_concat":
+      B, T, C = x.shape
+      x = self.token_proj(x)               # (B, T, d) -- shared weights across all T tokens
+      return x.reshape(B, T * x.shape[-1])  # (B, T*d)
     return x.mean(dim=1)  # mean pooling -> (B, C)
 
   def forward(self, x, plucker):
     # x: (B, K, 3, H, W) -- K context views. plucker: (B, K, 6, H, W).
     B, K, C_in, H, W = x.shape
-    if self.pool_mode == "concat":
+    if self.pool_mode in ("concat", "proj_and_concat"):
       assert K == self.num_context_views, (
-          f"concat pooling was built for num_context_views="
+          f"{self.pool_mode!r} pooling was built for num_context_views="
           f"{self.num_context_views}, but got {K} views at runtime -- its "
-          "Linear layer has a fixed input size")
+          "output size is fixed by that")
     x = x.reshape(B * K, C_in, H, W)
     plucker = plucker.reshape(B * K, plucker.shape[2], H, W)
 

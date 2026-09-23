@@ -149,9 +149,12 @@ def load_pretrained_tokengs_encoder(vit_encoder: ViTImageEncoder, tokengs_checkp
 
   remapped = remap_tokengs_encoder_state_dict(tokengs_state_dict, multiscale_layers)
   missing, unexpected = vit_encoder.load_state_dict(remapped, strict=False)
-  unexplained_missing = set(missing) - set(allow_missing)
-  assert not unexplained_missing and not unexpected, (list(unexplained_missing), unexpected)
-  return missing, unexpected
+  unexplained_missing = list(set(missing) - set(allow_missing))
+  assert not unexplained_missing and not unexpected, (unexplained_missing, unexpected)
+  # missing keys covered by allow_missing were expected (e.g. concat_pool_proj/
+  # token_proj, which have no TokenGS counterpart at all) -- the caller
+  # already declared them fine, so don't hand them back for a second check.
+  return unexplained_missing, unexpected
 
 
 if __name__ == "__main__":

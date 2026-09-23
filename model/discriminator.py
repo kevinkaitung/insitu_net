@@ -18,7 +18,7 @@ class Discriminator(nn.Module):
                vit_num_heads=8, vit_mlp_ratio=4.0, vit_qk_norm=True,
                vit_init_values=0.01, vit_multiscale_layers=(5, 7, 9, 11),
                vit_pool_mode="mean", vit_num_context_views=None,
-               vit_concat_pool_dim=512):
+               vit_concat_pool_dim=512, vit_token_proj_dim=4):
     super(Discriminator, self).__init__()
 
     self.dvp, self.dvpe = dvp, dvpe
@@ -33,7 +33,7 @@ class Discriminator(nn.Module):
       qk_norm=vit_qk_norm, init_values=vit_init_values,
       multiscale_layers=vit_multiscale_layers,
       pool_mode=vit_pool_mode, num_context_views=vit_num_context_views,
-      concat_pool_dim=vit_concat_pool_dim
+      concat_pool_dim=vit_concat_pool_dim, token_proj_dim=vit_token_proj_dim
     )
     self.image_proj_subnet = nn.Sequential(
       nn.Linear(self.image_encoder.embed_dim, dife), nn.ReLU(),
