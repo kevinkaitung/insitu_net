@@ -158,15 +158,25 @@ class ViTImageEncoder(nn.Module):
   """Vendored, simplified ViT encoder for multi-view image conditioning.
 
   patch_embed(rgb) + patch_plucker_embed(plucker) -> joint sequence over
-  all views' patches -> stack of Block -> LayerNorm -> pool (mean, for
-  now) -> (B, embed_dim). Matches TokenGS's tokengs.py _embed_encoder_input
-  (patchify each view independently, concatenate into one joint sequence
-  so patches from different views can attend to each other) + enc_dec.py's
+  all views' patches -> stack of Block -> LayerNorm -> pool -> (B, embed_dim).
+  Matches TokenGS's tokengs.py _embed_encoder_input (patchify each view
+  independently, concatenate into one joint sequence so patches from
+  different views can attend to each other) + enc_dec.py's
   EncDecBackbone.encoder/encoder_norm.
+
+  `pool_mode` picks how the (B, T, C) block-stack output collapses to
+  (B, embed_dim): "mean" (default) averages over all T tokens, parameter-
+  free, works for any T at runtime. "concat" instead flattens all T tokens'
+  channels into one (T*C,) vector per batch element and Linear-projects it
+  to `concat_pool_dim` -- unlike mean pooling this needs a *fixed* T, so
+  `num_context_views` must be given and every forward() call must use
+  exactly that many views. T*C is typically enormous (see the assert in
+  __init__), so this is meant for deliberately small configs.
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
-               qk_norm=True, init_values=0.01, multiscale_layers=(5, 7, 9, 11)):
+               qk_norm=True, init_values=0.01, multiscale_layers=(5, 7, 9, 11),
+               pool_mode="mean", num_context_views=None, concat_pool_dim=512):
     super().__init__()
     # Port of TokenGS's EncDecBackbone.use_multiscale=True path
     # (tokengs/models/enc_dec.py's _encode_features): rather than a single
@@ -174,7 +184,7 @@ class ViTImageEncoder(nn.Module):
     # sequence at each index in `multiscale_layers` (without feeding those
     # snapshots back into the residual stream -- every block still only
     # ever sees the previous block's raw output) and concatenate the
-    # snapshots channel-wise. embed_dim below ends up
+    # snapshots channel-wise. Per-token channel count below ends up
     # embed_dim * len(multiscale_layers) accordingly.
     self.multiscale_layers = tuple(multiscale_layers)
 
@@ -192,17 +202,41 @@ class ViTImageEncoder(nn.Module):
     self.multiscale_norms = nn.ModuleList([
         nn.LayerNorm(embed_dim) for _ in self.multiscale_layers
     ])
-    self.embed_dim = embed_dim * len(self.multiscale_layers)
+
+    self.pool_mode = pool_mode
+    self.num_context_views = num_context_views
+    per_token_dim = embed_dim * len(self.multiscale_layers)
+    if pool_mode == "concat":
+      assert num_context_views is not None, (
+          "num_context_views is required when pool_mode='concat' -- unlike "
+          "mean-pooling, flattening every patch token needs a fixed sequence "
+          "length to size the projection Linear layer")
+      num_tokens = num_context_views * self.patch_embed.num_patches
+      flatten_dim = num_tokens * per_token_dim
+      self.concat_pool_proj = nn.Linear(flatten_dim, concat_pool_dim)
+      self.embed_dim = concat_pool_dim
+    elif pool_mode == "mean":
+      self.embed_dim = per_token_dim
+    else:
+      raise ValueError(f"unknown pool_mode {pool_mode!r}, expected 'mean' or 'concat'")
 
   def pool(self, x):
-    # (B, N, C) -> (B, C). Isolated on purpose: mean-pool for now, swap for
-    # attention-pooling (learnable query cross-attending into patch tokens)
-    # as a later follow-up without touching anything else in this class.
-    return x.mean(dim=1)
+    # x: (B, T, C) -- T = num_context_views * patches-per-view, C = embed_dim
+    # * len(multiscale_layers) (the multiscale channel-concat already done
+    # in forward() below).
+    if self.pool_mode == "concat":
+      B, T, C = x.shape
+      return self.concat_pool_proj(x.reshape(B, T * C))
+    return x.mean(dim=1)  # mean pooling -> (B, C)
 
   def forward(self, x, plucker):
     # x: (B, K, 3, H, W) -- K context views. plucker: (B, K, 6, H, W).
     B, K, C_in, H, W = x.shape
+    if self.pool_mode == "concat":
+      assert K == self.num_context_views, (
+          f"concat pooling was built for num_context_views="
+          f"{self.num_context_views}, but got {K} views at runtime -- its "
+          "Linear layer has a fixed input size")
     x = x.reshape(B * K, C_in, H, W)
     plucker = plucker.reshape(B * K, plucker.shape[2], H, W)
 

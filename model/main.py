@@ -110,6 +110,23 @@ def parse_args():
                       help="block indices to snapshot+concatenate when "
                            "--vit-use-multiscale is set (default: 5 7 9 11, "
                            "TokenGS's own default; ignored otherwise)")
+  parser.add_argument("--vit-pool-mode", type=str, default="mean", choices=["mean", "concat"],
+                      help="how the ViT encoder's per-token features collapse "
+                           "into one vector: 'mean' averages over every patch "
+                           "token (parameter-free, works for any number of "
+                           "context views); 'concat' flattens every patch "
+                           "token across all views and Linear-projects the "
+                           "result to --vit-concat-pool-dim -- this fixes the "
+                           "encoder to exactly --num-context-views views, and "
+                           "the projection layer's parameter count scales as "
+                           "num_context_views * patches_per_view * "
+                           "embed_dim * len(multiscale_layers), which gets "
+                           "very large very fast (default: mean)")
+  parser.add_argument("--vit-concat-pool-dim", type=int, default=512,
+                      help="output dim of the concat-pooling projection "
+                           "Linear layer, i.e. what the rest of InSituNet "
+                           "consumes as the image feature; only used when "
+                           "--vit-pool-mode=concat (default: 512)")
 
   parser.add_argument("--tokengs-checkpoint", type=str, default="",
                       help="path to a pretrained TokenGS safetensors checkpoint "
@@ -319,6 +336,26 @@ def main(args):
         "--vit-multiscale-layers for a shallower encoder."
         .format(list(vit_multiscale_layers), vit_kwargs["vit_depth"]))
   vit_kwargs["vit_multiscale_layers"] = vit_multiscale_layers
+  vit_kwargs["vit_pool_mode"] = args.vit_pool_mode
+  vit_kwargs["vit_num_context_views"] = args.num_context_views
+  vit_kwargs["vit_concat_pool_dim"] = args.vit_concat_pool_dim
+
+  if args.vit_pool_mode == "concat":
+    num_tokens = args.num_context_views * (vit_kwargs["img_size"] // vit_kwargs["patch_size"]) ** 2
+    flatten_dim = num_tokens * vit_kwargs["vit_embed_dim"] * len(vit_multiscale_layers)
+    n_proj_params = flatten_dim * args.vit_concat_pool_dim
+    if accelerator.is_main_process:
+      print("=> --vit-pool-mode=concat: concat_pool_proj is Linear({}, {}) "
+            "= {:.2f}B parameters ({:.1f} GiB in fp32)"
+            .format(flatten_dim, args.vit_concat_pool_dim,
+                    n_proj_params / 1e9, n_proj_params * 4 / 2**30))
+
+  # concat_pool_proj (if --vit-pool-mode=concat) has no TokenGS counterpart --
+  # TokenGS has no pooling layer of its own at all, that's entirely
+  # InSituNet's own addition -- so it always loads with its own random init
+  # rather than from the checkpoint.
+  encoder_allow_missing = (("concat_pool_proj.weight", "concat_pool_proj.bias")
+                           if args.vit_pool_mode == "concat" else ())
 
   g_model = Generator(dvp=args.dvp, dvpe=args.dvpe, dife=args.dife, ch=args.ch, **vit_kwargs)
   g_model.apply(weights_init)
@@ -339,11 +376,13 @@ def main(args):
   # training state rather than just a starting point)
   if args.tokengs_checkpoint:
     missing, unexpected = load_pretrained_tokengs_encoder(
-        g_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers)
+        g_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers,
+        allow_missing=encoder_allow_missing)
     assert not missing and not unexpected, (missing, unexpected)
     if args.gan_loss != "none":
       missing, unexpected = load_pretrained_tokengs_encoder(
-          d_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers)
+          d_model.image_encoder, args.tokengs_checkpoint, vit_multiscale_layers,
+          allow_missing=encoder_allow_missing)
       assert not missing and not unexpected, (missing, unexpected)
     if accelerator.is_main_process:
       print("=> loaded pretrained TokenGS encoder from {} into g_model{}"

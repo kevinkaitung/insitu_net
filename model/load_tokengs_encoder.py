@@ -130,18 +130,27 @@ def remap_tokengs_encoder_state_dict(tokengs_state_dict, multiscale_layers=(5, 7
 
 
 def load_pretrained_tokengs_encoder(vit_encoder: ViTImageEncoder, tokengs_checkpoint_path: str,
-                                    multiscale_layers=(5, 7, 9, 11)):
+                                    multiscale_layers=(5, 7, 9, 11), allow_missing=()):
   """Loads a TokenGS safetensors checkpoint's encoder trunk directly into
   an already-constructed InSituNet ViTImageEncoder, in place. Raises if any
   remapped key doesn't match the target module's own state dict (shape or
-  name mismatch) -- see infer_encoder_hparams for building a `vit_encoder`
-  whose hyperparameters are guaranteed to match first.
+  name mismatch), except for keys named in `allow_missing` -- see
+  infer_encoder_hparams for building a `vit_encoder` whose hyperparameters
+  are guaranteed to match first.
+
+  `allow_missing`: names of `vit_encoder` parameters expected to have no
+  TokenGS counterpart and thus load with their own random init (e.g.
+  concat_pool_proj.weight/.bias when pool_mode="concat" -- TokenGS itself
+  has no pooling layer at all, that's entirely InSituNet's own addition).
+  Any *other* missing key, or any unexpected key, still raises.
   """
   with safe_open(tokengs_checkpoint_path, framework="pt") as f:
     tokengs_state_dict = {k: f.get_tensor(k) for k in f.keys()}
 
   remapped = remap_tokengs_encoder_state_dict(tokengs_state_dict, multiscale_layers)
-  missing, unexpected = vit_encoder.load_state_dict(remapped, strict=True)
+  missing, unexpected = vit_encoder.load_state_dict(remapped, strict=False)
+  unexplained_missing = set(missing) - set(allow_missing)
+  assert not unexplained_missing and not unexpected, (list(unexplained_missing), unexpected)
   return missing, unexpected
 
 
