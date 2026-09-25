@@ -178,13 +178,18 @@ class ViTImageEncoder(nn.Module):
   Deep Sets/PointNet's "shared per-element transform, then aggregate"),
   then flattening the small per-token outputs into (T*token_proj_dim,).
   Also needs a fixed T (num_context_views), but the flatten is on
-  T*token_proj_dim instead of T*C, avoiding "concat"'s blowup.
+  T*token_proj_dim instead of T*C, avoiding "concat"'s blowup. "token_mix"
+  is the transpose of that: a single Linear(T, token_mix_dim) applied along
+  the token axis, shared across all C channels (MLP-Mixer's token-mixing
+  direction), giving (C*token_mix_dim,). With token_mix_dim=1 this is a
+  learned per-position weighted sum over tokens -- mean pooling is the
+  special case of all weights = 1/T. Also needs a fixed T.
   """
   def __init__(self, img_size=256, patch_size=16, in_chans=3, embed_dim=512,
                depth=4, num_heads=8, mlp_ratio=4.0, qkv_bias=True,
                qk_norm=True, init_values=0.01, multiscale_layers=(5, 7, 9, 11),
                pool_mode="mean", num_context_views=None, concat_pool_dim=512,
-               token_proj_dim=4):
+               token_proj_dim=4, token_mix_dim=1):
     super().__init__()
     # Port of TokenGS's EncDecBackbone.use_multiscale=True path
     # (tokengs/models/enc_dec.py's _encode_features): rather than a single
@@ -230,11 +235,27 @@ class ViTImageEncoder(nn.Module):
       self.token_proj = nn.Linear(per_token_dim, token_proj_dim)
       num_tokens = num_context_views * self.patch_embed.num_patches
       self.embed_dim = num_tokens * token_proj_dim
+    elif pool_mode == "token_mix":
+      assert num_context_views is not None, (
+          "num_context_views is required when pool_mode='token_mix' -- the "
+          "Linear along the token axis is sized by the total token count")
+      num_tokens = num_context_views * self.patch_embed.num_patches
+      self.token_mix = nn.Linear(num_tokens, token_mix_dim)
+      self.embed_dim = per_token_dim * token_mix_dim
     elif pool_mode == "mean":
       self.embed_dim = per_token_dim
     else:
       raise ValueError(f"unknown pool_mode {pool_mode!r}, expected 'mean', "
-                       "'concat', or 'proj_and_concat'")
+                       "'concat', 'proj_and_concat', or 'token_mix'")
+
+  def trunk_parameters(self):
+    # Everything before pool(): the part mirroring TokenGS's encoder (and
+    # loadable from a TokenGS checkpoint). Excludes any pooling head
+    # (concat_pool_proj/token_proj/token_mix), which has no TokenGS
+    # counterpart and must stay trainable when the trunk is frozen.
+    for module in (self.patch_embed, self.patch_plucker_embed,
+                   self.blocks, self.multiscale_norms):
+      yield from module.parameters()
 
   def pool(self, x):
     # x: (B, T, C) -- T = num_context_views * patches-per-view, C = embed_dim
@@ -247,12 +268,16 @@ class ViTImageEncoder(nn.Module):
       B, T, C = x.shape
       x = self.token_proj(x)               # (B, T, d) -- shared weights across all T tokens
       return x.reshape(B, T * x.shape[-1])  # (B, T*d)
+    if self.pool_mode == "token_mix":
+      B, T, C = x.shape
+      x = self.token_mix(x.transpose(1, 2))  # (B, C, k) -- same weights for every channel
+      return x.reshape(B, C * x.shape[-1])   # (B, C*k)
     return x.mean(dim=1)  # mean pooling -> (B, C)
 
   def forward(self, x, plucker):
     # x: (B, K, 3, H, W) -- K context views. plucker: (B, K, 6, H, W).
     B, K, C_in, H, W = x.shape
-    if self.pool_mode in ("concat", "proj_and_concat"):
+    if self.pool_mode in ("concat", "proj_and_concat", "token_mix"):
       assert K == self.num_context_views, (
           f"{self.pool_mode!r} pooling was built for num_context_views="
           f"{self.num_context_views}, but got {K} views at runtime -- its "

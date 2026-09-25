@@ -111,7 +111,7 @@ def parse_args():
                            "--vit-use-multiscale is set (default: 5 7 9 11, "
                            "TokenGS's own default; ignored otherwise)")
   parser.add_argument("--vit-pool-mode", type=str, default="mean",
-                      choices=["mean", "concat", "proj_and_concat"],
+                      choices=["mean", "concat", "proj_and_concat", "token_mix"],
                       help="how the ViT encoder's per-token features collapse "
                            "into one vector: 'mean' averages over every patch "
                            "token (parameter-free, works for any number of "
@@ -128,8 +128,13 @@ def parse_args():
                            "then flattens -- also fixes the encoder to exactly "
                            "--num-context-views views, but the flatten is on "
                            "num_context_views * patches_per_view * "
-                           "vit_token_proj_dim, avoiding 'concat's blowup "
-                           "(default: mean)")
+                           "vit_token_proj_dim, avoiding 'concat's blowup; "
+                           "'token_mix' applies one Linear along the token "
+                           "axis instead (shared across channels, MLP-Mixer's "
+                           "token-mixing direction), reducing T tokens to "
+                           "--vit-token-mix-dim while keeping every channel -- "
+                           "also fixes the encoder to exactly "
+                           "--num-context-views views (default: mean)")
   parser.add_argument("--vit-concat-pool-dim", type=int, default=512,
                       help="output dim of the concat-pooling projection "
                            "Linear layer, i.e. what the rest of InSituNet "
@@ -141,6 +146,11 @@ def parse_args():
                            "(the flattened/concatenated feature InSituNet "
                            "consumes ends up num_context_views * "
                            "patches_per_view * this; default: 4)")
+  parser.add_argument("--vit-token-mix-dim", type=int, default=1,
+                      help="number of outputs of the Linear along the token "
+                           "axis when --vit-pool-mode=token_mix (the feature "
+                           "InSituNet consumes ends up per_token_dim * this; "
+                           "default: 1)")
 
   parser.add_argument("--tokengs-checkpoint", type=str, default="",
                       help="path to a pretrained TokenGS safetensors checkpoint "
@@ -354,6 +364,7 @@ def main(args):
   vit_kwargs["vit_num_context_views"] = args.num_context_views
   vit_kwargs["vit_concat_pool_dim"] = args.vit_concat_pool_dim
   vit_kwargs["vit_token_proj_dim"] = args.vit_token_proj_dim
+  vit_kwargs["vit_token_mix_dim"] = args.vit_token_mix_dim
 
   per_token_dim = vit_kwargs["vit_embed_dim"] * len(vit_multiscale_layers)
   num_tokens = args.num_context_views * (vit_kwargs["img_size"] // vit_kwargs["patch_size"]) ** 2
@@ -374,6 +385,15 @@ def main(args):
             "output dim {:,}"
             .format(per_token_dim, args.vit_token_proj_dim, n_proj_params,
                     num_tokens, output_dim))
+  elif args.vit_pool_mode == "token_mix":
+    n_proj_params = num_tokens * args.vit_token_mix_dim + args.vit_token_mix_dim
+    output_dim = per_token_dim * args.vit_token_mix_dim
+    if accelerator.is_main_process:
+      print("=> --vit-pool-mode=token_mix: token_mix is Linear({}, {}) "
+            "= {:,} parameters (shared across all {} channels), "
+            "flattened output dim {:,}"
+            .format(num_tokens, args.vit_token_mix_dim, n_proj_params,
+                    per_token_dim, output_dim))
 
   # concat_pool_proj/token_proj (depending on --vit-pool-mode) have no
   # TokenGS counterpart -- TokenGS has no pooling layer of its own at all,
@@ -383,6 +403,8 @@ def main(args):
     encoder_allow_missing = ("concat_pool_proj.weight", "concat_pool_proj.bias")
   elif args.vit_pool_mode == "proj_and_concat":
     encoder_allow_missing = ("token_proj.weight", "token_proj.bias")
+  elif args.vit_pool_mode == "token_mix":
+    encoder_allow_missing = ("token_mix.weight", "token_mix.bias")
   else:
     encoder_allow_missing = ()
 
@@ -418,24 +440,26 @@ def main(args):
             .format(args.tokengs_checkpoint,
                     " and d_model" if args.gan_loss != "none" else ""))
 
-  # Freeze the ViT image encoder (patch_embed, patch_plucker_embed, blocks,
-  # multiscale_norms -- pool() has no parameters of its own, so this covers
-  # everything before it) so TokenGS and InSituNet are compared using the
-  # exact same, un-fine-tuned encoder weights. requires_grad=False here is
-  # also what keeps these params out of the optimizer below and out of
-  # DDP's gradient sync once accelerator.prepare() wraps the model.
+  # Freeze the ViT encoder trunk (patch_embed, patch_plucker_embed, blocks,
+  # multiscale_norms -- everything before pool()) so TokenGS and InSituNet
+  # are compared using the exact same, un-fine-tuned encoder weights. Any
+  # pooling head (concat_pool_proj/token_proj/token_mix) stays trainable.
+  # requires_grad=False here is also what keeps these params out of the
+  # optimizer below and out of DDP's gradient sync once accelerator.prepare()
+  # wraps the model.
   if args.freeze_vit_encoder:
     if not args.tokengs_checkpoint and accelerator.is_main_process:
       print("=> WARNING: --freeze-vit-encoder with no --tokengs-checkpoint "
             "freezes a randomly-initialized encoder for the entire run")
-    for p in g_model.image_encoder.parameters():
+    for p in g_model.image_encoder.trunk_parameters():
       p.requires_grad = False
     if args.gan_loss != "none":
-      for p in d_model.image_encoder.parameters():
+      for p in d_model.image_encoder.trunk_parameters():
         p.requires_grad = False
     if accelerator.is_main_process:
-      print("=> froze g_model.image_encoder{}".format(
-          " and d_model.image_encoder" if args.gan_loss != "none" else ""))
+      print("=> froze the ViT encoder trunk of g_model{} (pooling head, if "
+            "any, stays trainable)".format(
+                " and d_model" if args.gan_loss != "none" else ""))
 
   # loss
   if args.perc_loss != "none":
