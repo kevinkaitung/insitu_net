@@ -10,7 +10,7 @@ from torchvision import models
 class VGG19(nn.Module):
   def __init__(self, layer="relu1_2"):
     super(VGG19, self).__init__()
-    features = models.vgg19(pretrained=True).features
+    features = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
 
     self.layer_dict = {"relu1_1": 2, "relu1_2": 4,
                        "relu2_1": 7, "relu2_2": 9,

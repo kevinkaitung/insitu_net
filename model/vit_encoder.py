@@ -48,7 +48,7 @@ class Attention(nn.Module):
     self.num_heads = num_heads
     self.head_dim = dim // num_heads
     self.scale = self.head_dim ** -0.5
-    # torch==1.13.1 (this repo's pinned version) has no
+    # torch==1.13.1 (this repo's old pinned version) has no
     # F.scaled_dot_product_attention; auto-detect so this still picks the
     # fused path if ever run under a newer torch.
     self.fused_attn = _HAS_SDPA if fused_attn is None else fused_attn
