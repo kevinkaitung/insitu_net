@@ -34,6 +34,14 @@ from vgg19 import VGG19
 from load_tokengs_encoder import infer_encoder_hparams, load_pretrained_tokengs_encoder
 from safetensors import safe_open
 
+def per_image_psnr(pred, gt):
+  # pred/gt in the generator's [-1, 1] range. PSNR on [0, 1] images (peak = 1),
+  # one value per image -- same formula as TokenGS's
+  # tokengs/models/losses.py, so the numbers are directly comparable.
+  pred01, gt01 = (pred + 1.) * .5, (gt + 1.) * .5
+  mse = ((pred01 - gt01) ** 2).mean(dim=(1, 2, 3))
+  return -10. * torch.log10(mse)  # (B,)
+
 # parse arguments
 def parse_args():
   parser = argparse.ArgumentParser(description="InSituNet")
@@ -518,6 +526,7 @@ def main(args):
     if args.gan_loss != "none":
       d_model.train()
     train_loss = torch.tensor(0., device=device)
+    train_psnr_sum = torch.tensor(0., device=device)
     n_train = torch.tensor(0., device=device)
     for i, sample in enumerate(train_loader):
       image = sample["image"].to(device)
@@ -526,6 +535,11 @@ def main(args):
       vparams = sample["vparams"].to(device)
       g_optimizer.zero_grad()
       fake_image = g_model(input_image, plucker, vparams)
+
+      # before the perceptual-loss branch below reassigns image/fake_image
+      with torch.no_grad():
+        batch_psnr = per_image_psnr(fake_image.detach(), image)
+      train_psnr_sum += batch_psnr.sum()
 
       # snapshot before the perceptual-loss branch below reassigns
       # image/fake_image to ImageNet-normalized values in place
@@ -606,7 +620,8 @@ def main(args):
           epoch, i * image.size(0), len(train_loader.dataset),
           100. * i / len(train_loader),
           loss.item()))
-        wandb_log({"epoch": epoch, "train/batch_loss": loss.item()})
+        wandb_log({"epoch": epoch, "train/batch_loss": loss.item(),
+                   "train/batch_psnr": batch_psnr.mean().item()})
         if args.gan_loss != "none":
           print("DLoss: {:.6f}, GLoss: {:.6f}".format(
             d_loss.item(), g_loss.item()))
@@ -618,17 +633,22 @@ def main(args):
 
     # true cross-process average: gather each process's local sum before dividing
     train_loss = accelerator.gather_for_metrics(train_loss).sum()
+    train_psnr_sum = accelerator.gather_for_metrics(train_psnr_sum).sum()
     n_train = accelerator.gather_for_metrics(n_train).sum()
     if accelerator.is_main_process:
       avg_train_loss = (train_loss / n_train).item()
-      print("====> Epoch: {} Average loss: {:.4f}".format(epoch, avg_train_loss))
-      wandb_log({"epoch": epoch, "train/epoch_avg_loss": avg_train_loss})
+      avg_train_psnr = (train_psnr_sum / n_train).item()
+      print("====> Epoch: {} Average loss: {:.4f} PSNR: {:.2f} dB".format(
+          epoch, avg_train_loss, avg_train_psnr))
+      wandb_log({"epoch": epoch, "train/epoch_avg_loss": avg_train_loss,
+                 "train/epoch_avg_psnr": avg_train_psnr})
 
     # testing...
     g_model.eval()
     if args.gan_loss != "none":
       d_model.eval()
     test_loss = torch.tensor(0., device=device)
+    test_psnr_sum = torch.tensor(0., device=device)
     n_test = torch.tensor(0., device=device)
     with torch.no_grad():
       for i, sample in enumerate(test_loader):
@@ -639,6 +659,7 @@ def main(args):
         fake_image = g_model(input_image, plucker, vparams)
         batch_n = torch.tensor(float(image.size(0)), device=device)
         test_loss += mse_criterion(image, fake_image).detach() * batch_n
+        test_psnr_sum += per_image_psnr(fake_image, image).sum()
         n_test += batch_n
 
         if i == 0 and accelerator.is_main_process:
@@ -647,12 +668,16 @@ def main(args):
               "test/comparison", epoch, input_image, image, fake_image)
 
     test_loss = accelerator.gather_for_metrics(test_loss).sum()
+    test_psnr_sum = accelerator.gather_for_metrics(test_psnr_sum).sum()
     n_test = accelerator.gather_for_metrics(n_test).sum()
     if accelerator.is_main_process:
       avg_test_loss = (test_loss / n_test).item()
+      avg_test_psnr = (test_psnr_sum / n_test).item()
       test_losses.append(avg_test_loss)
-      print("====> Epoch: {} Test set loss: {:.4f}".format(epoch, avg_test_loss))
-      wandb_log({"epoch": epoch, "test/loss": avg_test_loss})
+      print("====> Epoch: {} Test set loss: {:.4f} PSNR: {:.2f} dB".format(
+          epoch, avg_test_loss, avg_test_psnr))
+      wandb_log({"epoch": epoch, "test/loss": avg_test_loss,
+                 "test/psnr": avg_test_psnr})
 
     # saving...
     if (epoch + 1) % args.check_every == 0 or epoch == args.epochs - 1:
