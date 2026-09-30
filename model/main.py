@@ -108,16 +108,21 @@ def parse_args():
   parser.add_argument("--vit-use-multiscale", action="store_true", default=True,
                       help="use TokenGS's multiscale encoder (concatenate "
                            "LayerNorm'd snapshots at --vit-multiscale-layers "
-                           "instead of a single final norm); default: True, "
-                           "matching every known TokenGS config")
+                           "instead of a single final norm); default: True. "
+                           "Overridden by --tokengs-checkpoint, which detects "
+                           "whether the checkpoint was trained with it")
   parser.add_argument("--no-vit-use-multiscale", dest="vit_use_multiscale",
                       action="store_false",
                       help="disable the multiscale encoder -- falls back to "
-                           "a single LayerNorm snapshot at the last block")
+                           "a single LayerNorm snapshot at the last block. "
+                           "Overridden by --tokengs-checkpoint")
   parser.add_argument("--vit-multiscale-layers", type=int, nargs="+", default=[5, 7, 9, 11],
                       help="block indices to snapshot+concatenate when "
                            "--vit-use-multiscale is set (default: 5 7 9 11, "
-                           "TokenGS's own default; ignored otherwise)")
+                           "TokenGS's own default; ignored otherwise). Not "
+                           "recoverable from --tokengs-checkpoint (only the "
+                           "number of layers is), so must match what the "
+                           "checkpoint was trained with")
   parser.add_argument("--vit-pool-mode", type=str, default="mean",
                       choices=["mean", "concat", "proj_and_concat", "token_mix"],
                       help="how the ViT encoder's per-token features collapse "
@@ -327,10 +332,10 @@ def main(args):
 
   # ViT image-encoder hyperparameters: when --tokengs-checkpoint is given,
   # --vit-patch-size/--vit-embed-dim/--vit-depth/--vit-num-heads/
-  # --vit-mlp-ratio/--vit-init-values are overridden by what that checkpoint's
-  # own tensor shapes actually require (see load_tokengs_encoder.py) --
-  # img_size and multiscale_layers can't be recovered from a checkpoint (no
-  # tensor shape depends on either), so those stay CLI-driven either way.
+  # --vit-mlp-ratio/--vit-init-values/--vit-use-multiscale are overridden by
+  # what that checkpoint's own tensors actually require (see
+  # load_tokengs_encoder.py). img_size and the multiscale block indices
+  # can't be recovered from a checkpoint, so those stay CLI-driven.
   vit_kwargs = dict(img_size=args.vit_img_size, patch_size=args.vit_patch_size,
                     vit_embed_dim=args.vit_embed_dim, vit_depth=args.vit_depth,
                     vit_num_heads=args.vit_num_heads, vit_mlp_ratio=args.vit_mlp_ratio,
@@ -341,12 +346,27 @@ def main(args):
     with safe_open(args.tokengs_checkpoint, framework="pt") as f:
       shapes = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
     inferred = infer_encoder_hparams(shapes)
-    inferred.pop("num_multiscale")
+    num_multiscale = inferred.pop("num_multiscale")  # None -> single encoder_norm
+    ckpt_multiscale = num_multiscale is not None
     if accelerator.is_main_process:
       print("=> inferring ViT encoder hyperparameters from --tokengs-checkpoint "
-            "{}: {} (overrides --vit-patch-size/--vit-embed-dim/--vit-depth/"
-            "--vit-num-heads/--vit-mlp-ratio/--vit-init-values/--no-vit-qk-norm)"
-            .format(args.tokengs_checkpoint, inferred))
+            "{}: {}, multiscale encoder: {} (overrides --vit-patch-size/"
+            "--vit-embed-dim/--vit-depth/--vit-num-heads/--vit-mlp-ratio/"
+            "--vit-init-values/--no-vit-qk-norm/--vit-use-multiscale)"
+            .format(args.tokengs_checkpoint, inferred,
+                    "{} layers".format(num_multiscale) if ckpt_multiscale else "off"))
+      if ckpt_multiscale != args.vit_use_multiscale:
+        print("=> checkpoint was trained {} the multiscale encoder; overriding "
+              "--vit-use-multiscale to {}".format(
+                  "with" if ckpt_multiscale else "without", ckpt_multiscale))
+    args.vit_use_multiscale = ckpt_multiscale
+    if ckpt_multiscale and len(args.vit_multiscale_layers) != num_multiscale:
+      raise ValueError(
+          "--tokengs-checkpoint has {} multiscale norms but "
+          "--vit-multiscale-layers {} has {} entries; the block indices "
+          "aren't stored in the checkpoint, so pass the ones it was trained "
+          "with".format(num_multiscale, args.vit_multiscale_layers,
+                        len(args.vit_multiscale_layers)))
     vit_kwargs.update(patch_size=inferred["patch_size"],
                       vit_embed_dim=inferred["embed_dim"],
                       vit_depth=inferred["depth"],
@@ -368,6 +388,25 @@ def main(args):
         "--vit-multiscale-layers for a shallower encoder."
         .format(list(vit_multiscale_layers), vit_kwargs["vit_depth"]))
   vit_kwargs["vit_multiscale_layers"] = vit_multiscale_layers
+
+  # wandb.init(config=vars(args)) above logged the CLI values; record the
+  # ones actually used (inferred from --tokengs-checkpoint, and the resolved
+  # snapshot layers) so the run config matches the model that was trained.
+  args.vit_patch_size = vit_kwargs["patch_size"]
+  args.vit_embed_dim = vit_kwargs["vit_embed_dim"]
+  args.vit_depth = vit_kwargs["vit_depth"]
+  args.vit_num_heads = vit_kwargs["vit_num_heads"]
+  args.vit_mlp_ratio = vit_kwargs["vit_mlp_ratio"]
+  args.no_vit_qk_norm = not vit_kwargs["vit_qk_norm"]
+  args.vit_init_values = vit_kwargs["vit_init_values"]
+  args.vit_multiscale_layers = list(vit_multiscale_layers)
+  if not args.no_wandb and accelerator.is_main_process:
+    wandb.config.update(
+        {k: getattr(args, k) for k in (
+            "vit_patch_size", "vit_embed_dim", "vit_depth", "vit_num_heads",
+            "vit_mlp_ratio", "no_vit_qk_norm", "vit_init_values",
+            "vit_use_multiscale", "vit_multiscale_layers")},
+        allow_val_change=True)
   vit_kwargs["vit_pool_mode"] = args.vit_pool_mode
   vit_kwargs["vit_num_context_views"] = args.num_context_views
   vit_kwargs["vit_concat_pool_dim"] = args.vit_concat_pool_dim

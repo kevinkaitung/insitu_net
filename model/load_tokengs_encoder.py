@@ -1,6 +1,6 @@
 """Remaps a pretrained TokenGS checkpoint's encoder trunk (patch_embed,
-patch_plucker_embed, the ViT block stack, and its multiscale final norms)
-into InSituNet's own ViTImageEncoder (vit_encoder.py).
+patch_plucker_embed, the ViT block stack, and its final norm(s)) into
+InSituNet's own ViTImageEncoder (vit_encoder.py).
 
 Only the *encoder* is remapped -- TokenGS's decoder (gs_tokens,
 decoder_blocks, latent_*, activation_head, ...) has no InSituNet
@@ -8,12 +8,17 @@ counterpart and is ignored entirely.
 
 Hyperparameters (embed_dim, patch_size, depth, num_heads, mlp_ratio) are
 inferred directly from the checkpoint's own tensor shapes, so callers don't
-need to know or pass them. The one exception is `multiscale_layers` (which
-block indices got snapshotted): that's a plain Python tuple of ints in
-TokenGS's Options, never written into the checkpoint itself, so it can't be
-recovered from tensor shapes -- only the *count* of multiscale norms can be
-(here, 4). It defaults to TokenGS's own default, (5, 7, 9, 11), which is
-confirmed correct for this checkpoint.
+need to know or pass them. So is whether the checkpoint used TokenGS's
+multiscale encoder (multiscale_norms.* present) or a single final norm
+(encoder_norm.* present), and, for multiscale, how many norms it has. The
+one thing that can't be recovered is *which* block indices the multiscale
+norms snapshot: that's a plain Python tuple in TokenGS's Options, never
+written into the checkpoint. It defaults to TokenGS's own default,
+(5, 7, 9, 11).
+
+A single-norm checkpoint computes encoder_norm(encoder(x)) -- one LayerNorm
+after the last block -- which is exactly ViTImageEncoder with
+multiscale_layers=(depth - 1,), so encoder_norm loads into multiscale_norms.0.
 """
 
 import re
@@ -107,15 +112,19 @@ def remap_tokengs_encoder_state_dict(tokengs_state_dict, multiscale_layers=(5, 7
     elif key.startswith("enc_dec_backbone.multiscale_norms."):
       new_key = key[len("enc_dec_backbone."):]  # multiscale_norms.{k}.* -- identical name
       remapped[new_key] = tensor
-    elif key == "enc_dec_backbone.encoder_norm.weight" or key == "enc_dec_backbone.encoder_norm.bias":
-      # Non-multiscale checkpoints only. ViTImageEncoder no longer has a
-      # single self.norm (see vit_encoder.py) -- flag rather than silently
-      # drop, since this would mean the checkpoint needs the other loading
-      # path (num_multiscale=None), not this one.
-      raise ValueError(
-          f"found non-multiscale {key!r} but ViTImageEncoder now always "
-          "expects TokenGS's multiscale-encoder path; this checkpoint needs "
-          "different handling (use_multiscale_encoder=False at train time).")
+    elif key.startswith("enc_dec_backbone.encoder_norm."):
+      # Single-norm checkpoint: TokenGS computes encoder_norm(encoder(x)),
+      # one LayerNorm after the last block -- exactly ViTImageEncoder with a
+      # single snapshot at the last block, so it loads into multiscale_norms.0.
+      last_block = max(int(m.group(1)) for k in tokengs_state_dict
+                       if (m := _BLOCK_IDX_RE.match(k)))
+      if tuple(multiscale_layers) != (last_block,):
+        raise ValueError(
+            f"checkpoint was trained without the multiscale encoder (has "
+            f"{key!r}), so it needs multiscale_layers=({last_block},) -- a "
+            f"single snapshot at the last block -- but got "
+            f"{tuple(multiscale_layers)}; use --no-vit-use-multiscale")
+      remapped["multiscale_norms.0." + key.rsplit(".", 1)[1]] = tensor
     # everything else (decoder_blocks, gs_tokens, activation_head, latent_*,
     # k_proj_norm, kv_proj, ...) has no InSituNet counterpart -- skipped.
 
@@ -177,11 +186,14 @@ if __name__ == "__main__":
 
   # NOTE: since this is the script for smoke test, we hard-code values of multiscale_layers here
   # change it if needed, but we usually use default values defined in tokengs
-  multiscale_layers = (5, 7, 9, 11)
-  assert num_multiscale == len(multiscale_layers), (
-      f"checkpoint has {num_multiscale} multiscale norms, but the default "
-      f"multiscale_layers={multiscale_layers} implies {len(multiscale_layers)}; "
-      "pass the correct layer indices explicitly")
+  if num_multiscale is None:
+    multiscale_layers = (hparams["depth"] - 1,)  # single-norm checkpoint
+  else:
+    multiscale_layers = (5, 7, 9, 11)
+    assert num_multiscale == len(multiscale_layers), (
+        f"checkpoint has {num_multiscale} multiscale norms, but the default "
+        f"multiscale_layers={multiscale_layers} implies {len(multiscale_layers)}; "
+        "pass the correct layer indices explicitly")
 
   encoder = ViTImageEncoder(img_size=args.img_size, multiscale_layers=multiscale_layers, **hparams)
   missing, unexpected = load_pretrained_tokengs_encoder(encoder, args.checkpoint, multiscale_layers)
@@ -195,5 +207,5 @@ if __name__ == "__main__":
   plucker = torch.randn(B, K, 6, args.img_size, args.img_size)
   with torch.no_grad():
     out = encoder(x, plucker)
-  print("forward output shape:", tuple(out.shape), "(expect", (B, hparams["embed_dim"] * num_multiscale), ")")
+  print("forward output shape:", tuple(out.shape), "(expect", (B, hparams["embed_dim"] * len(multiscale_layers)), ")")
   print("OK")
