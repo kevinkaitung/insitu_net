@@ -8,6 +8,9 @@ from skimage import io
 import torch
 from torch.utils.data import Dataset
 
+from view_sampling import (direction_signature, directions_from_c2ws,
+                           kmeans_unit, labels_to_members)
+
 
 def _discover_scenes(root):
   scenes = []
@@ -106,6 +109,41 @@ def _sample_context_and_target(rng, num_views, num_context_views, min_gap, max_g
   return context_idx, target_idx
 
 
+def _even_sample_context_and_target(rng, c2ws, num_context_views, kmeans_seed,
+                                    cluster_cache):
+  # Port of methods/TokenGS/tokengs/data/provider.py's
+  # Provider._even_sample_indices, for exactly one target. Context views:
+  # k-means the scene's camera directions on the sphere into
+  # num_context_views regions (seeded, so regions are stable across epochs
+  # and DataLoader workers; cached per camera rig like TokenGS's
+  # _even_input_clusters), then pick one random view per region with `rng`
+  # (so views vary per step while coverage holds). Target: TokenGS clusters
+  # the leftover views into num_views - num_input_views regions and picks one
+  # per region; with a single target that is one region holding every
+  # leftover view (kmeans_unit's k == 1 case), i.e. a uniform pick from the
+  # views not used as context. min_gap/max_gap don't apply.
+  #
+  # c2ws: (N, 4, 4), already _to_opencv_convention-converted -- the same
+  # matrices TokenGS clusters (DL3DV10K.load_cameras' output).
+  dirs = directions_from_c2ws(c2ws)
+  N = dirs.shape[0]
+  assert N >= num_context_views + 1, (
+      f"even sampling needs at least num_context_views + 1 = "
+      f"{num_context_views + 1} views for disjoint context/target, got {N}")
+
+  sig = direction_signature(dirs, num_context_views)
+  members = cluster_cache.get(sig)
+  if members is None:
+    members = labels_to_members(
+        kmeans_unit(dirs, num_context_views, seed=kmeans_seed), num_context_views)
+    cluster_cache[sig] = members
+  context_idx = [int(rng.choice(m)) for m in members]
+
+  leftover = np.setdiff1d(np.arange(N), context_idx)
+  target_idx = int(rng.choice(leftover))
+  return context_idx, target_idx
+
+
 def _load_transforms(root, scene):
   transforms_path = os.path.join(root, scene, "gaussian_splat", "transforms.json")
   with open(transforms_path) as f:
@@ -144,11 +182,14 @@ class FFGSImageDataset(Dataset):
 
   One dataset entry per *scene* (not per view) -- matching TokenGS's own
   Provider.__len__ (== number of scenes) exactly, rather than enumerating
-  every view. Each access draws one fresh, randomly-windowed sample from
-  that scene: `num_context_views` context images (the model's input) and
-  one target image (what the model predicts), both drawn from a shared
-  random window of view indices via _sample_context_and_target (a direct
-  port of TokenGS's Provider._get_indices_static).
+  every view. Each access draws one fresh sample from that scene:
+  `num_context_views` context images (the model's input) and one target
+  image (what the model predicts). `view_sampling` picks how, mirroring
+  TokenGS's opt.view_sampling: "random" draws both from a shared random
+  window of view indices (_sample_context_and_target, a port of
+  Provider._get_indices_static); "even" spreads the context views over the
+  viewpoint sphere via k-means regions (_even_sample_context_and_target, a
+  port of Provider._even_sample_indices).
 
   Camera poses are converted to OpenCV convention (_to_opencv_convention,
   matching TokenGS's DL3DV10K.load_cameras exactly) and recentered
@@ -166,13 +207,21 @@ class FFGSImageDataset(Dataset):
   """
   def __init__(self, root, train=True, test_scene_fraction=0.1,
                scene_split_seed=42, num_context_views=6, scene_scale=1.0,
-               min_view_gap=10, max_view_gap=25, transform=None):
+               min_view_gap=10, max_view_gap=25, view_sampling="random",
+               even_kmeans_seed=42, transform=None):
+    if view_sampling not in ("random", "even"):
+      raise ValueError(f"view_sampling must be 'random' or 'even', got {view_sampling!r}")
     self.root = root
     self.train = train
     self.num_context_views = num_context_views
     self.scene_scale = scene_scale
     self.min_view_gap = min_view_gap
     self.max_view_gap = max_view_gap
+    self.view_sampling = view_sampling
+    self.even_kmeans_seed = even_kmeans_seed
+    # camera-rig signature -> context-view clusters (TokenGS's
+    # _even_input_clusters); each DataLoader worker fills its own copy lazily
+    self._even_clusters = {}
     self.transform = transform
 
     all_scenes = _discover_scenes(root)
@@ -198,8 +247,12 @@ class FFGSImageDataset(Dataset):
     # target across separate evaluation runs (mirrors TokenGS's
     # get_rng()'s eval branch: np.random.default_rng(seed + idx)).
     rng = random if self.train else random.Random(index)
-    input_idx, target_idx = _sample_context_and_target(
-        rng, num_views, K, self.min_view_gap, self.max_view_gap)
+    if self.view_sampling == "even":
+      input_idx, target_idx = _even_sample_context_and_target(
+          rng, transform_matrices, K, self.even_kmeans_seed, self._even_clusters)
+    else:
+      input_idx, target_idx = _sample_context_and_target(
+          rng, num_views, K, self.min_view_gap, self.max_view_gap)
 
     image = io.imread(file_paths[target_idx])[:, :, 0:3]
     input_image = np.stack([io.imread(file_paths[i])[:, :, 0:3] for i in input_idx])

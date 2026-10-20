@@ -70,6 +70,19 @@ def parse_args():
   parser.add_argument("--scene-scale", type=float, default=1.0,
                       help="fixed scale factor applied to camera translations "
                            "(TokenGS's camera_scale_method='constant'; default: 1.0)")
+  parser.add_argument("--view-sampling", type=str, default="random",
+                      choices=["random", "even"],
+                      help="how context/target views are picked per sample, "
+                           "mirroring TokenGS's --view-sampling: 'random' uses "
+                           "a random window of view indices (--min/max-view-gap); "
+                           "'even' spreads the context views over the viewpoint "
+                           "sphere via k-means regions with a random view per "
+                           "region, and picks the target uniformly from the "
+                           "remaining views (gap flags ignored) (default: random)")
+  parser.add_argument("--even-kmeans-seed", type=int, default=42,
+                      help="seed for --view-sampling even's k-means regions; "
+                           "42 matches TokenGS's default seed, giving the same "
+                           "regions TokenGS uses (default: 42)")
   parser.add_argument("--min-view-gap", type=int, default=10,
                       help="minimum window size (in view-index steps) that "
                            "context+target views are sampled from, ported from "
@@ -294,6 +307,7 @@ def main(args):
       num_context_views=args.num_context_views,
       scene_scale=args.scene_scale,
       min_view_gap=args.min_view_gap, max_view_gap=args.max_view_gap,
+      view_sampling=args.view_sampling, even_kmeans_seed=args.even_kmeans_seed,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   test_dataset = FFGSImageDataset(
@@ -303,6 +317,7 @@ def main(args):
       num_context_views=args.num_context_views,
       scene_scale=args.scene_scale,
       min_view_gap=args.min_view_gap, max_view_gap=args.max_view_gap,
+      view_sampling=args.view_sampling, even_kmeans_seed=args.even_kmeans_seed,
       transform=transforms.Compose([Normalize(), ToTensor()]))
 
   kwargs = {"num_workers": 4, "pin_memory": True, "worker_init_fn": _worker_init_fn}
