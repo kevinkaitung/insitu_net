@@ -14,5 +14,7 @@ wandb/
 *.pth
 *.pth.tar
 
+results
+
 # extracted sample dataset (regenerate via `unzip mpas_sub.zip`)
 mpas_sub/
